@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local runtime/state
+wechat_receipt_state.db
+wechat_receipt_state.db-shm
+wechat_receipt_state.db-wal
+wechat_receipt.out.log
+wechat_receipt.err.log
+wechat_receipt.pid
+
+# Local outputs
+pagamentos_wechat.xlsx
+pagamentos_wechat_legacy_*.xlsx
+
+# Local/private mapping (contains real group names)
+clientes_grupos.json
+
+# Large local decrypted artifacts
+decrypted_msg/
+
+# Editor / OS
+.DS_Store
+Thumbs.db

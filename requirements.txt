@@ -1,0 +1,8 @@
+openpyxl>=3.1
+Pillow>=10.0
+watchdog>=4.0
+rapidocr-onnxruntime>=1.4
+pywxdump>=3.1
+
+# Optional fallback OCR engine
+pytesseract>=0.3
