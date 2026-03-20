@@ -175,10 +175,27 @@ if ($effectiveSinkMode -eq "google-sheets") {
 }
 
 $argumentLine = ($arguments | ForEach-Object { Convert-ToCliArg ([string]$_) }) -join " "
-$p = Start-Process -FilePath $py -ArgumentList $argumentLine -WorkingDirectory $dir -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
-$p.Id | Set-Content -Path $pidf -Encoding ascii
+$existingPids = @()
+try {
+  $existingPids = @(Get-Process -Name python -ErrorAction Stop | ForEach-Object { $_.Id })
+} catch {
+  $existingPids = @()
+}
+
+$cmdLine = 'start "" /b ' + (Convert-ToCliArg $py) + ' ' + $argumentLine + ' 1>> ' + (Convert-ToCliArg $logOut) + ' 2>> ' + (Convert-ToCliArg $logErr)
+cmd /c $cmdLine | Out-Null
 Start-Sleep -Seconds 2
-if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {
+$p = $null
+try {
+  $p = Get-Process -Name python -ErrorAction Stop |
+    Where-Object { $existingPids -notcontains $_.Id } |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
+} catch {
+  $p = $null
+}
+if ($p) {
+  $p.Id | Set-Content -Path $pidf -Encoding ascii
   Write-Output "INICIADO PID=$($p.Id)"
   Write-Output "LOG=$log"
   if ($effectiveSinkMode -eq "google-sheets") {

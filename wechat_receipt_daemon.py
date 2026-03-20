@@ -309,10 +309,38 @@ DATE_PATTERNS = [
 ALPHA_MONTH_DATE_PATTERN = re.compile(r"\b(\d{1,2})\s*[-/]?\s*([A-Za-z]{3})\s*[-/]?\s*(\d{4})\b", re.IGNORECASE)
 TIME_PATTERN = re.compile(r"\b(\d{2}:\d{2}(?::\d{2})?)\b")
 AMOUNT_CURRENCY_PATTERN = re.compile(
-    r"(R\$?|RS|US\$|USD|BRL|CNY|RMB|¥|￥)\s*([0-9][0-9\.,]{0,20})",
+    r"(?<![A-Z0-9])(R\$|RS|US\$|USD|BRL|CNY|RMB|¥|￥|R(?=\s))\s*([0-9][0-9\.,]{0,20})",
     re.IGNORECASE,
 )
-AMOUNT_FALLBACK_PATTERN = re.compile(r"(?<!\d)([0-9]{1,3}(?:[\.,][0-9]{3})*[\.,][0-9]{2})(?!\d)")
+AMOUNT_FALLBACK_PATTERN = re.compile(
+    r"(?<!\d)([0-9]{1,3}(?:[\.,][0-9]{3})+(?:[\.,][0-9]{1,2})?|[0-9]+[\.,][0-9]{1,2})(?!\d)"
+)
+AMOUNT_DIRECT_HINTS = (
+    "valor",
+    "pagamento",
+    "transfer",
+    "pix",
+    "enviado",
+    "recebido",
+    "total",
+)
+AMOUNT_NEGATIVE_HINTS = (
+    "tarifa",
+    "taxa",
+    "juros",
+    "autentic",
+    "documento",
+    "agencia",
+    "conta",
+    "chave",
+    "cnpj",
+    "cpf",
+    "telefone",
+    "ouvidoria",
+    "codigo",
+    "protocolo",
+    "id",
+)
 MONTH_TOKEN_MAP = {
     "JAN": 1,
     "FEB": 2,
@@ -352,6 +380,15 @@ BENEFICIARY_KEYS = [
 ]
 
 BANK_ALLOWED = ("AMD", "DIAMOND", "CLEEND")
+CLIENT_LABEL_SPECIAL_CASES = {
+    "PP": "6",
+}
+IGNORED_SENDER_USERNAMES = {
+    "wxid_wml3ftd6qpea12",
+    "wxid_jhb1tt23of8422",
+    "wxid_5sd4qzz1lyhl12",
+    "jinshuo2004",
+}
 
 
 def normalize_text_for_match(value: str) -> str:
@@ -372,6 +409,37 @@ def detect_bank(text: str, beneficiary: Optional[str]) -> Optional[str]:
     if "AMD" in compact:
         return "AMD"
     return None
+
+
+def normalize_client_label(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    label = str(value or "").strip()
+    if not label:
+        return (None, None)
+
+    normalized = unicodedata.normalize("NFKC", label).upper().replace("—", "-")
+    normalized_without_year = re.sub(r"\b2026\b", " ", normalized)
+    match = re.search(r"\d+(?:-\d+)*(?:[A-Z](?![A-Z]))?", normalized_without_year)
+    if match:
+        return (re.sub(r"[^A-Z0-9]", "", match.group(0)), None)
+
+    compact_letters = re.sub(r"[^A-Z]", "", normalized_without_year)
+    for key, mapped in CLIENT_LABEL_SPECIAL_CASES.items():
+        if key in compact_letters:
+            return (mapped, None)
+
+    if not re.search(r"[A-Z0-9]", normalized):
+        return (None, "IGNORED_CLIENT_LABEL_EMPTY")
+    if not re.search(r"[A-Z0-9]", normalized_without_year):
+        return (None, "IGNORED_CLIENT_LABEL_DECORATIVE")
+    return (label, None)
+
+
+def should_ignore_sender(msg_ref: Optional["WeChatMessageRef"]) -> bool:
+    if msg_ref is None:
+        return False
+    sender = str(msg_ref.sender_user_name or "").strip().lower()
+    talker = str(msg_ref.talker or "").strip().lower()
+    return sender in IGNORED_SENDER_USERNAMES or talker in IGNORED_SENDER_USERNAMES
 
 
 def normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
@@ -500,20 +568,94 @@ def normalize_amount(value: str) -> Optional[float]:
     s = re.sub(r"[^\d,\.]", "", value.strip())
     if not s:
         return None
+
+    grouped_thousands_comma = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+", s))
+    grouped_thousands_dot = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s))
+
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
     elif "," in s:
-        if re.search(r",\d{1,2}$", s):
-            s = s.replace(".", "").replace(",", ".")
+        if grouped_thousands_comma:
+            s = s.replace(",", "")
+        elif re.search(r",\d{1,2}$", s):
+            s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
+    elif "." in s:
+        if grouped_thousands_dot:
+            s = s.replace(".", "")
+        elif re.search(r"\.\d{1,2}$", s):
+            pass
+        elif re.search(r"\.\d{3}$", s):
+            s = s.replace(".", "")
     try:
         return round(float(s), 2)
     except Exception:
         return None
+
+
+def extract_best_amount(lines: list[str]) -> tuple[Optional[float], Optional[str]]:
+    candidates: list[tuple[int, int, int, float, Optional[str]]] = []
+    order = 0
+    for idx, line in enumerate(lines):
+        prev_low = lines[idx - 1].lower() if idx > 0 else ""
+        line_low = line.lower()
+        next_low = lines[idx + 1].lower() if idx + 1 < len(lines) else ""
+        context_low = " ".join(part for part in (prev_low, line_low, next_low) if part)
+
+        def score_candidate(raw_value: str, currency: Optional[str], source: str) -> int:
+            score = 30 if source == "currency" else 18
+            if any(token in prev_low for token in AMOUNT_DIRECT_HINTS):
+                score += 18
+            if any(token in line_low for token in AMOUNT_DIRECT_HINTS):
+                score += 10
+            if any(token in next_low for token in AMOUNT_DIRECT_HINTS):
+                score += 4
+            if any(token in context_low for token in AMOUNT_NEGATIVE_HINTS):
+                score -= 14
+            if re.search(r"[.,]\d{1,2}$", raw_value):
+                score += 4
+            if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?", raw_value):
+                score += 3
+            if currency == "BRL":
+                score += 2
+            if "." not in raw_value and "," not in raw_value:
+                score -= 3
+            return score
+
+        for m in AMOUNT_CURRENCY_PATTERN.finditer(line):
+            raw_value = m.group(2)
+            value = normalize_amount(raw_value)
+            if value is None:
+                continue
+            currency = normalize_currency_code(m.group(1))
+            candidates.append((score_candidate(raw_value, currency, "currency"), idx, order, value, currency))
+            order += 1
+
+        for m in AMOUNT_FALLBACK_PATTERN.finditer(line):
+            raw_value = m.group(1)
+            value = normalize_amount(raw_value)
+            if value is None:
+                continue
+            candidates.append((score_candidate(raw_value, None, "fallback"), idx, order, value, None))
+            order += 1
+
+    if not candidates:
+        return (None, None)
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    best_score, best_idx, _best_order, best_value, best_currency = candidates[0]
+    if best_currency is None:
+        for score, idx, _order, value, currency in candidates:
+            if score != best_score or idx != best_idx or value != best_value:
+                continue
+            if currency is not None:
+                best_currency = currency
+                break
+    return (best_value, best_currency)
 
 
 def prepare_image_for_ocr(img: Image.Image, source_kind: str) -> Image.Image:
@@ -551,24 +693,9 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
         txn_time = mt.group(1)
     txn_time = normalize_time_for_excel(txn_time)
 
-    currency: Optional[str] = None
-    amount: Optional[float] = None
-    amount_candidates: list[float] = []
-    for m in AMOUNT_CURRENCY_PATTERN.finditer(raw):
-        cur = m.group(1)
-        val = normalize_amount(m.group(2))
-        if val is not None:
-            amount_candidates.append(val)
-            currency = normalize_currency_code(cur)
-    if not amount_candidates:
-        for m in AMOUNT_FALLBACK_PATTERN.finditer(raw):
-            val = normalize_amount(m.group(1))
-            if val is not None:
-                amount_candidates.append(val)
-    if amount_candidates:
-        amount = max(amount_candidates)
-        if currency is None:
-            currency = "BRL"
+    amount, currency = extract_best_amount(lines)
+    if amount is not None and currency is None:
+        currency = "BRL"
 
     beneficiary: Optional[str] = None
     low_lines = [ln.lower() for ln in lines]
@@ -646,6 +773,8 @@ class WeChatMessageRef:
     msg_svr_id: Optional[str]
     talker: Optional[str]
     create_time: float
+    sender_user_name: Optional[str]
+    sender_display: Optional[str]
     image_rel_path: Optional[str]
     thumb_rel_path: Optional[str]
     image_abs_path: Optional[Path]
@@ -689,21 +818,34 @@ class ClientResolver:
         self.map_path = map_path
         self._mtime: float = -1.0
         self._map: dict[str, str] = {}
+        self._raw_map: dict[str, str] = {}
         self.reload_if_needed(force=True)
 
     def _normalize_keys(self, data: dict[str, Any]) -> dict[str, str]:
         out: dict[str, str] = {}
         for k, v in data.items():
             key = str(k).strip().lower()
-            val = str(v).strip()
-            if key and val:
-                out[key] = val
+            client, _ignore_reason = normalize_client_label(v)
+            if key and client:
+                out[key] = client
         return out
+
+    def ignore_reason(self, source_path: Path) -> Optional[str]:
+        self.reload_if_needed()
+        gid = extract_group_id_from_path(source_path)
+        if not gid:
+            return None
+        raw_value = self._raw_map.get(str(gid).strip().lower())
+        if raw_value is None:
+            return None
+        _client, ignore_reason = normalize_client_label(raw_value)
+        return ignore_reason
 
     def reload_if_needed(self, force: bool = False) -> None:
         if not self.map_path.exists():
             if force or self._map:
                 self._map = {}
+                self._raw_map = {}
                 self._mtime = -1.0
             return
         mtime = self.map_path.stat().st_mtime
@@ -713,11 +855,18 @@ class ClientResolver:
             raw = self.map_path.read_text(encoding="utf-8")
             data = json.loads(raw)
             if isinstance(data, dict):
+                self._raw_map = {
+                    str(k).strip().lower(): str(v).strip()
+                    for k, v in data.items()
+                    if str(k).strip() and str(v).strip()
+                }
                 self._map = self._normalize_keys(data)
             else:
+                self._raw_map = {}
                 self._map = {}
             self._mtime = mtime
         except Exception:
+            self._raw_map = {}
             self._map = {}
             self._mtime = mtime
 
@@ -848,9 +997,10 @@ class WeChatDBResolver:
             return None
         return self.wechat_root.joinpath(*parts)
 
-    def _extract_media_paths(self, bytes_extra: Any) -> tuple[Optional[str], Optional[str]]:
+    def _extract_media_paths(self, bytes_extra: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
         image_rel: Optional[str] = None
         thumb_rel: Optional[str] = None
+        sender_user_name: Optional[str] = None
         try:
             decoded = self._decode_bytes_extra(bytes_extra) if self._decode_bytes_extra else {}
         except Exception:
@@ -863,6 +1013,8 @@ class WeChatDBResolver:
                     continue
                 key = str(item.get("1") or "").strip()
                 value = str(item.get("2") or "").strip()
+                if key == "1" and sender_user_name is None and value:
+                    sender_user_name = value
                 if "filestorage" not in value.lower():
                     continue
                 if key == "4" and image_rel is None:
@@ -871,7 +1023,7 @@ class WeChatDBResolver:
                     thumb_rel = value
 
         if image_rel or thumb_rel:
-            return image_rel, thumb_rel
+            return image_rel, thumb_rel, sender_user_name
 
         raw_text = str(decoded)
         matches = re.findall(r"(wxid_[^\\']+\\FileStorage\\[^']+)", raw_text)
@@ -881,7 +1033,7 @@ class WeChatDBResolver:
                 image_rel = match
             elif "\\thumb\\" in lowered and thumb_rel is None:
                 thumb_rel = match
-        return image_rel, thumb_rel
+        return image_rel, thumb_rel, sender_user_name
 
     def _recent_messages(
         self,
@@ -916,7 +1068,7 @@ class WeChatDBResolver:
 
         out: list[WeChatMessageRef] = []
         for row in rows:
-            image_rel, thumb_rel = self._extract_media_paths(row["BytesExtra"])
+            image_rel, thumb_rel, sender_user_name = self._extract_media_paths(row["BytesExtra"])
             if not image_rel and not thumb_rel:
                 continue
             out.append(
@@ -924,6 +1076,8 @@ class WeChatDBResolver:
                     msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
                     talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
                     create_time=float(row["CreateTime"]),
+                    sender_user_name=sender_user_name,
+                    sender_display=None,
                     image_rel_path=image_rel,
                     thumb_rel_path=thumb_rel,
                     image_abs_path=self._absolute_path_from_rel(image_rel),
@@ -973,14 +1127,14 @@ class WeChatDBResolver:
             return None
         return next(iter(unique.values()))
 
-    def resolve_talker_display_name(self, talker: str) -> Optional[str]:
-        talker = str(talker or "").strip()
-        if not talker:
+    def resolve_contact_display_name(self, username: Optional[str]) -> Optional[str]:
+        username = str(username or "").strip()
+        if not username:
             return None
         if not self.refresh_if_due():
-            return talker
+            return username
         if not self.merge_path.exists():
-            return talker
+            return username
 
         conn = sqlite3.connect(str(self.merge_path))
         conn.row_factory = sqlite3.Row
@@ -992,18 +1146,21 @@ class WeChatDBResolver:
                 WHERE UserName=?
                 LIMIT 1
                 """,
-                (talker,),
+                (username,),
             ).fetchone()
         finally:
             conn.close()
 
         if row is None:
-            return talker
+            return username
         for key in ("Remark", "NickName", "Alias"):
             value = str(row[key] or "").strip()
             if value:
                 return value
-        return talker
+        return username
+
+    def resolve_talker_display_name(self, talker: str) -> Optional[str]:
+        return self.resolve_contact_display_name(talker)
 
 
 class StateDB:
@@ -3141,6 +3298,25 @@ def process_item(
                 print(f"[SKIP] {path.name} | temp_resolved_by_later_success")
                 return
             raise FileNotFoundError(f"Resolved file disappeared: {path}")
+
+        if should_ignore_sender(resolution.msg_ref):
+            sender_label = (
+                resolution.msg_ref.sender_display
+                or resolution.msg_ref.sender_user_name
+                or resolution.msg_ref.talker
+                or "unknown"
+            )
+            db.mark_done(item.file_id, sha256="", processed_at=time.time(), note=f"IGNORED_SENDER:{sender_label}")
+            db.mark_message_job_resolved(msg_svr_id, note=f"IGNORED_SENDER:{sender_label}")
+            print(f"[SKIP] {path.name} | ignored_sender={sender_label}")
+            return
+
+        ignore_reason = resolver.ignore_reason(resolution.client_source_path)
+        if ignore_reason:
+            db.mark_done(item.file_id, sha256="", processed_at=time.time(), note=ignore_reason)
+            db.mark_message_job_resolved(msg_svr_id, note=ignore_reason)
+            print(f"[SKIP] {path.name} | {ignore_reason}")
+            return
 
         client = resolver.resolve(resolution.client_source_path)
         if not client:
