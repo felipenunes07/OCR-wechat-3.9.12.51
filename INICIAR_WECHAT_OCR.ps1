@@ -49,6 +49,7 @@ $gsheetReviewWorksheet = "Revisar"
 $recentFilesHours = 24
 $originalWaitSeconds = 90
 $tempCorrelationSeconds = 30
+$thumbCandidatesEnabled = $false
 $resolutionMode = "db-first"
 $verificationColumnName = "STATUS_VERIFICACAO"
 $uiForceDownloadEnabled = $false
@@ -76,6 +77,7 @@ if (Test-Path $sinkConfigPath) {
   if ($sinkConfig.recent_files_hours) { $recentFilesHours = [int]$sinkConfig.recent_files_hours }
   if ($sinkConfig.original_wait_seconds) { $originalWaitSeconds = [int]$sinkConfig.original_wait_seconds }
   if ($sinkConfig.temp_correlation_seconds) { $tempCorrelationSeconds = [int]$sinkConfig.temp_correlation_seconds }
+  if ($null -ne $sinkConfig.thumb_candidates_enabled) { $thumbCandidatesEnabled = [bool]$sinkConfig.thumb_candidates_enabled }
   if ($sinkConfig.resolution_mode) { $resolutionMode = [string]$sinkConfig.resolution_mode }
   if ($sinkConfig.verification_column_name) { $verificationColumnName = [string]$sinkConfig.verification_column_name }
   if ($null -ne $sinkConfig.ui_force_download_enabled) { $uiForceDownloadEnabled = [bool]$sinkConfig.ui_force_download_enabled }
@@ -134,6 +136,7 @@ $arguments = @(
   "--db-merge-path", $dbMergePath,
   "--original-wait-seconds", "$originalWaitSeconds",
   "--temp-correlation-seconds", "$tempCorrelationSeconds",
+  "--thumb-candidates-enabled", ($(if ($thumbCandidatesEnabled) { "true" } else { "false" })),
   "--verification-column-name", $verificationColumnName,
   "--ui-force-download-enabled", ($(if ($uiForceDownloadEnabled) { "true" } else { "false" })),
   "--ui-force-delay-seconds", "$uiForceDelaySeconds",
@@ -208,6 +211,7 @@ if ($p) {
     Write-Output "EXCEL=$excel"
   }
   Write-Output "RESOLUTION_MODE=$resolutionMode"
+  Write-Output "THUMB_CANDIDATES_ENABLED=$thumbCandidatesEnabled"
   Write-Output "DB_MERGE_PATH=$dbMergePath"
   Write-Output "UI_FORCE_DOWNLOAD_ENABLED=$uiForceDownloadEnabled"
   Write-Output "UI_FORCE_DELAY_SECONDS=$uiForceDelaySeconds"

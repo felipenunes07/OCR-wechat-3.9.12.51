@@ -82,9 +82,17 @@ BASE_LANC_HEADERS = [
 DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
+REALTIME_SOURCE_EVENTS = {"created", "modified", "ui-force"}
+MANUAL_OPEN_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "temp_image"}
+MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
+MANUAL_OPEN_ONLY_WAIT_REASONS = (
+    "MANUAL_WAIT_ORIGINAL",
+    "WAITING_ORIGINAL_MEDIA",
+    "WAITING_TEMP_CONTEXT",
+)
 
 
-def is_candidate(path: Path) -> bool:
+def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     if not path.is_file():
         return False
     if path.suffix.lower() not in IMG_SUFFIXES:
@@ -99,14 +107,34 @@ def is_candidate(path: Path) -> bool:
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() in PLAIN_IMAGE_SUFFIXES:
         return True
 
-    # Fallback lane to avoid losing incoming files when only thumbnail is available.
-    if "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
+    # Optional fallback lane when thumbnail-only processing is desired.
+    if thumb_candidates_enabled and "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
         return True
 
     if "\\filestorage\\temp\\" in s and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
         return True
 
     return False
+
+
+def should_refresh_manual_session(source_kind: str, source_event: str) -> bool:
+    return source_kind in MANUAL_OPEN_SOURCE_KINDS and str(source_event or "").strip().lower() in REALTIME_SOURCE_EVENTS
+
+
+def wall_duration_ms(start_ts: float | None, end_ts: float | None = None) -> Optional[float]:
+    if start_ts is None or float(start_ts) <= 0:
+        return None
+    end_value = time.time() if end_ts is None else float(end_ts)
+    return max(0.0, (end_value - float(start_ts)) * 1000.0)
+
+
+def perf_duration_ms(start: float, end: float | None = None) -> float:
+    end_value = time.perf_counter() if end is None else float(end)
+    return max(0.0, (end_value - float(start)) * 1000.0)
+
+
+def format_ms(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.0f}"
 
 
 def detect_source_kind(path: Path) -> str:
@@ -317,6 +345,17 @@ def build_ocr_engine() -> OCREngine:
         "or\n"
         "- pip install pytesseract and install Tesseract OCR binary"
     )
+
+
+def warmup_ocr_engine(ocr: OCREngine) -> None:
+    started = time.perf_counter()
+    try:
+        blank = Image.new("RGB", (64, 64), "white")
+        ocr.extract(blank)
+    except Exception as exc:
+        print(f"[WARN] ocr_warmup_failed | err={type(exc).__name__}: {exc}")
+        return
+    print(f"[OCR] warmup_complete | ms={perf_duration_ms(started):.0f}")
 
 
 DATE_PATTERNS = [
@@ -1661,8 +1700,14 @@ class StateDB:
         payload = f"{str(path).lower()}|{stat.st_size}|{stat.st_mtime_ns}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
-    def upsert_candidate(self, path: Path, settle_seconds: int, source_event: str) -> Optional[str]:
-        if not is_candidate(path):
+    def upsert_candidate(
+        self,
+        path: Path,
+        settle_seconds: int,
+        source_event: str,
+        thumb_candidates_enabled: bool,
+    ) -> Optional[str]:
+        if not is_candidate(path, thumb_candidates_enabled=thumb_candidates_enabled):
             return None
         try:
             st = path.stat()
@@ -1676,6 +1721,8 @@ class StateDB:
         source_kind = detect_source_kind(path)
         ext = path.suffix.lower()
         next_attempt = now + max(1, settle_seconds)
+        refresh_manual_session = should_refresh_manual_session(source_kind, source_event)
+        candidate_id: Optional[str] = None
 
         with self._lock:
             cur = self._conn.cursor()
@@ -1688,7 +1735,7 @@ class StateDB:
                 LIMIT 1
                 """,
                 (str(path),),
-            ).fetchone()
+                ).fetchone()
             if existing is not None and existing["status"] in ("pending", "retry", "processing"):
                 cur.execute(
                     """
@@ -1705,36 +1752,40 @@ class StateDB:
                     ),
                 )
                 self._conn.commit()
-                return str(existing["file_id"])
+                candidate_id = str(existing["file_id"])
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO files(file_id, path, source_kind, ext, size, mtime, ctime, status, attempts, next_attempt, first_seen, last_seen)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                    ON CONFLICT(file_id) DO UPDATE SET
+                        last_seen=excluded.last_seen,
+                        mtime=excluded.mtime,
+                        size=excluded.size,
+                        next_attempt=CASE
+                            WHEN files.status IN ('done', 'duplicate') THEN files.next_attempt
+                            ELSE MIN(files.next_attempt, excluded.next_attempt)
+                        END
+                    """,
+                    (
+                        file_id,
+                        str(path),
+                        source_kind,
+                        ext,
+                        int(st.st_size),
+                        float(st.st_mtime),
+                        float(st.st_ctime),
+                        float(next_attempt),
+                        float(now),
+                        float(now),
+                    ),
+                )
+                self._conn.commit()
+                candidate_id = file_id
 
-            cur.execute(
-                """
-                INSERT INTO files(file_id, path, source_kind, ext, size, mtime, ctime, status, attempts, next_attempt, first_seen, last_seen)
-                VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-                ON CONFLICT(file_id) DO UPDATE SET
-                    last_seen=excluded.last_seen,
-                    mtime=excluded.mtime,
-                    size=excluded.size,
-                    next_attempt=CASE
-                        WHEN files.status IN ('done', 'duplicate') THEN files.next_attempt
-                        ELSE MIN(files.next_attempt, excluded.next_attempt)
-                    END
-                """,
-                (
-                    file_id,
-                    str(path),
-                    source_kind,
-                    ext,
-                    int(st.st_size),
-                    float(st.st_mtime),
-                    float(st.st_ctime),
-                    float(next_attempt),
-                    float(now),
-                    float(now),
-                ),
-            )
-            self._conn.commit()
-        return file_id
+        if refresh_manual_session:
+            self.start_manual_session(now)
+        return candidate_id
 
     def get_meta(self, key: str) -> Optional[str]:
         with self._lock:
@@ -1896,6 +1947,46 @@ class StateDB:
                   AND mtime < ?
                 """,
                 (float(now), float(older_than_mtime)),
+            )
+            self._conn.commit()
+            return count
+
+    def ignore_manual_open_only_waits(self) -> int:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            count = int(
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM files
+                    WHERE status IN ('pending', 'retry', 'processing')
+                      AND source_kind IN ('msgattach_thumb_dat', 'temp_image')
+                      AND (
+                        last_error IN (?, ?, ?)
+                        OR last_error LIKE 'WAITING_PRIOR_MESSAGE_ORDER:%'
+                      )
+                    """,
+                    MANUAL_OPEN_ONLY_WAIT_REASONS,
+                ).fetchone()[0]
+            )
+            if count <= 0:
+                return 0
+            cur.execute(
+                """
+                UPDATE files
+                SET status='ignored',
+                    processed_at=?,
+                    next_attempt=0,
+                    last_error=?
+                WHERE status IN ('pending', 'retry', 'processing')
+                  AND source_kind IN ('msgattach_thumb_dat', 'temp_image')
+                  AND (
+                    last_error IN (?, ?, ?)
+                    OR last_error LIKE 'WAITING_PRIOR_MESSAGE_ORDER:%'
+                  )
+                """,
+                (float(now), MANUAL_OPEN_ONLY_IGNORE_REASON, *MANUAL_OPEN_ONLY_WAIT_REASONS),
             )
             self._conn.commit()
             return count
@@ -2399,9 +2490,9 @@ class StateDB:
         now = time.time()
         scope = str(sheet_order_scope or "per_talker").strip().lower() or "per_talker"
         order = str(commit_order or "asc").strip().lower() or "asc"
-        order_by = "msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC"
+        order_by = "r.msg_create_time ASC, COALESCE(NULLIF(r.msg_svr_id, ''), 'file:' || r.file_id) ASC"
         if order == "desc":
-            order_by = "msg_create_time DESC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) DESC"
+            order_by = "r.msg_create_time DESC, COALESCE(NULLIF(r.msg_svr_id, ''), 'file:' || r.file_id) DESC"
         session_floor = float(manual_session_started_at or 0.0)
 
         with self._lock:
@@ -2409,25 +2500,27 @@ class StateDB:
             cur.execute("BEGIN IMMEDIATE")
             rows = cur.execute(
                 f"""
-                SELECT file_id, source_path, ingested_at, review_needed, msg_svr_id, talker,
-                       msg_create_time, client, txn_date, txn_time, bank, amount, amount_rounded, verification_status,
-                       sheet_payload_json, sheet_status
-                FROM receipts
-                WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
-                  AND COALESCE(sheet_next_attempt, 0) <= ?
+                SELECT r.file_id, r.source_path, r.ingested_at, r.review_needed, r.msg_svr_id, r.talker,
+                       r.msg_create_time, r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
+                       r.sheet_payload_json, r.sheet_status, f.first_seen AS source_first_seen
+                FROM receipts AS r
+                LEFT JOIN files AS f
+                  ON f.file_id = r.file_id
+                WHERE COALESCE(r.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
+                  AND COALESCE(r.sheet_next_attempt, 0) <= ?
                 ORDER BY
                     CASE
-                        WHEN ? > 0 AND COALESCE(ingested_at, 0) >= ? THEN 0
+                        WHEN ? > 0 AND COALESCE(r.ingested_at, 0) >= ? THEN 0
                         WHEN ? > 0 THEN 1
                         ELSE 0
                     END ASC,
                     CASE
-                        WHEN talker IS NOT NULL AND talker <> '' AND msg_create_time IS NOT NULL AND msg_create_time > 0
+                        WHEN r.talker IS NOT NULL AND r.talker <> '' AND r.msg_create_time IS NOT NULL AND r.msg_create_time > 0
                             THEN 0
                         ELSE 1
                     END ASC,
                     {order_by},
-                    ingested_at ASC
+                    r.ingested_at ASC
                 """,
                 (float(now), session_floor, session_floor, session_floor),
             ).fetchall()
@@ -2502,6 +2595,8 @@ class StateDB:
                 return {
                     "file_id": file_id,
                     "source_path": str(row["source_path"]),
+                    "ingested_at": float(row["ingested_at"] or 0.0),
+                    "source_first_seen": float(row["source_first_seen"] or 0.0),
                     "review_needed": bool(row["review_needed"]),
                     "msg_svr_id": msg_svr_id,
                     "talker": talker,
@@ -3320,19 +3415,30 @@ class GoogleSheetsSink(RowSink):
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
-    def __init__(self, db: StateDB, settle_seconds: int) -> None:
+    def __init__(self, db: StateDB, settle_seconds: int, thumb_candidates_enabled: bool) -> None:
         self.db = db
         self.settle_seconds = settle_seconds
+        self.thumb_candidates_enabled = thumb_candidates_enabled
 
     def on_created(self, event: Any) -> None:
         if event.is_directory:
             return
-        self.db.upsert_candidate(Path(event.src_path), self.settle_seconds, "created")
+        self.db.upsert_candidate(
+            Path(event.src_path),
+            self.settle_seconds,
+            "created",
+            thumb_candidates_enabled=self.thumb_candidates_enabled,
+        )
 
     def on_modified(self, event: Any) -> None:
         if event.is_directory:
             return
-        self.db.upsert_candidate(Path(event.src_path), self.settle_seconds, "modified")
+        self.db.upsert_candidate(
+            Path(event.src_path),
+            self.settle_seconds,
+            "modified",
+            thumb_candidates_enabled=self.thumb_candidates_enabled,
+        )
 
 
 @dataclass
@@ -3358,6 +3464,7 @@ class Config:
     max_retries: int
     original_wait_seconds: int
     temp_correlation_seconds: int
+    thumb_candidates_enabled: bool
     ui_force_download_enabled: bool
     ui_force_delay_seconds: int
     ui_force_scope: str
@@ -3387,7 +3494,7 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
-            if not is_candidate(p):
+            if not is_candidate(p, thumb_candidates_enabled=cfg.thumb_candidates_enabled):
                 continue
             try:
                 st = p.stat()
@@ -3395,7 +3502,12 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
                 continue
             if float(st.st_mtime) < scan_floor:
                 continue
-            if db.upsert_candidate(p, cfg.settle_seconds, "reconcile"):
+            if db.upsert_candidate(
+                p,
+                cfg.settle_seconds,
+                "reconcile",
+                thumb_candidates_enabled=cfg.thumb_candidates_enabled,
+            ):
                 count += 1
             newest_mtime = max(newest_mtime, float(st.st_mtime))
     db.set_meta("reconcile_watermark", f"{max(newest_mtime, now - overlap_sec):.6f}")
@@ -3521,9 +3633,19 @@ class UIForceDownloadWorker(threading.Thread):
                         resolved_path_str = getattr(result, "resolved_media_paths", {}).get(candidate.msg_svr_id)
                         resolved_path = Path(resolved_path_str) if resolved_path_str else candidate.expected_image_path
                         if resolved_path.exists():
-                            self.db.upsert_candidate(resolved_path, settle_seconds=1, source_event="ui-force")
+                            self.db.upsert_candidate(
+                                resolved_path,
+                                settle_seconds=1,
+                                source_event="ui-force",
+                                thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
+                            )
                         elif candidate.expected_image_path.exists():
-                            self.db.upsert_candidate(candidate.expected_image_path, settle_seconds=1, source_event="ui-force")
+                            self.db.upsert_candidate(
+                                candidate.expected_image_path,
+                                settle_seconds=1,
+                                source_event="ui-force",
+                                thumb_candidates_enabled=self.cfg.thumb_candidates_enabled,
+                            )
             except Exception as exc:
                 note = f"ui_worker_failed:{type(exc).__name__}:{exc}"
                 self.db.set_meta("last_ui_result", note)
@@ -3640,7 +3762,7 @@ def resolve_media_candidate(
                 using_thumb_fallback=False,
             )
 
-        if manual_materialization_mode:
+        if manual_materialization_mode and cfg.thumb_candidates_enabled:
             if tracked_job is not None:
                 db.set_message_job_state(
                     msg_ref.msg_svr_id if msg_ref is not None else None,
@@ -3815,6 +3937,8 @@ def process_item(
         db.mark_done(item.file_id, sha256="", processed_at=time.time())
         return
 
+    claim_started_at = time.time()
+    manual_open_to_claim_ms = wall_duration_ms(item.first_seen, claim_started_at)
     path = Path(item.path)
     resolution: Optional[MediaResolution] = None
     msg_svr_id: Optional[str] = None
@@ -3869,7 +3993,9 @@ def process_item(
             print(f"[HOLD] {path.name} | grupo_sem_mapa={gid}")
             return
 
+        open_started_at = time.perf_counter()
         img, img_bytes, _ext, _key = open_image_from_file(path)
+        open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
         if db.receipt_sha_exists(digest):
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
@@ -3878,8 +4004,12 @@ def process_item(
             return
         q_score = quality_score(img)
 
+        prep_started_at = time.perf_counter()
         img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
+        prep_ms = perf_duration_ms(prep_started_at)
+        ocr_started_at = time.perf_counter()
         text, ocr_conf = ocr.extract(img_for_ocr)
+        ocr_ms = perf_duration_ms(ocr_started_at)
         ocr_chars = len(text)
         is_receipt, receipt_reason = looks_like_single_receipt(text)
         if not is_receipt:
@@ -3888,6 +4018,7 @@ def process_item(
             print(f"[SKIP] {path.name} | not_receipt={receipt_reason}")
             return
 
+        parse_started_at = time.perf_counter()
         fields = parse_receipt_fields(text, ocr_conf=ocr_conf, q_score=q_score)
         bank = fields.get("bank")
         if bank is None:
@@ -3908,12 +4039,14 @@ def process_item(
             min_confidence=cfg.min_confidence,
             resolution_source=resolution.resolution_source,
         )
+        parse_ms = perf_duration_ms(parse_started_at)
+        ingested_at = time.time()
 
         payload: dict[str, Any] = {
             "file_id": item.file_id,
             "source_path": str(resolution.original_source_path),
             "source_kind": resolution.original_source_kind,
-            "ingested_at": time.time(),
+            "ingested_at": ingested_at,
             "sha256": digest,
             "txn_date": fields["txn_date"],
             "txn_time": fields["txn_time"],
@@ -3969,7 +4102,11 @@ def process_item(
         print(
             f"[OK] {path.name} | cliente={client} | banco={bank} | valor={fields['amount']} "
             f"| data={fields['txn_date']} {fields['txn_time']} | sink=staged "
-            f"| resolution={resolution.resolution_source} | verification={resolution.verification_status}"
+            f"| resolution={resolution.resolution_source} | verification={resolution.verification_status} "
+            f"| manual_open_to_claim_ms={format_ms(manual_open_to_claim_ms)} "
+            f"| open_ms={format_ms(open_ms)} | prep_ms={format_ms(prep_ms)} "
+            f"| ocr_ms={format_ms(ocr_ms)} | parse_ms={format_ms(parse_ms)} "
+            f"| manual_open_to_ingest_ms={format_ms(wall_duration_ms(item.first_seen, ingested_at))}"
         )
 
     except Exception as exc:
@@ -4010,6 +4147,8 @@ def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int
         msg_svr_id = str(claimed.get("msg_svr_id") or "").strip() or "-"
         talker = str(claimed.get("talker") or "").strip() or "-"
         msg_create_time = float(claimed.get("msg_create_time") or 0.0)
+        ingested_at = float(claimed.get("ingested_at") or 0.0)
+        source_first_seen = float(claimed.get("source_first_seen") or 0.0)
         try:
             sheet, row = sink.append(claimed["row_payload"], review_needed=bool(claimed["review_needed"]))
         except Exception as exc:
@@ -4018,11 +4157,14 @@ def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int
             print(f"[SINK] retry | file_id={file_id} | msg={msg_svr_id} | talker={talker} | err={err}")
             break
 
-        db.mark_receipt_sink_committed(file_id, sheet, row, committed_at=time.time())
+        committed_at = time.time()
+        db.mark_receipt_sink_committed(file_id, sheet, row, committed_at=committed_at)
         committed += 1
         print(
             f"[SINK] committed | file_id={file_id} | msg={msg_svr_id} | talker={talker} "
-            f"| create_time={msg_create_time:.0f} | sheet={sheet} | row={row}"
+            f"| create_time={msg_create_time:.0f} | sheet={sheet} | row={row} "
+            f"| ingest_to_commit_ms={format_ms(wall_duration_ms(ingested_at, committed_at))} "
+            f"| manual_open_to_commit_ms={format_ms(wall_duration_ms(source_first_seen, committed_at))}"
         )
     return committed
 
@@ -4260,6 +4402,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-retries", type=int, default=0, help="0 means infinite retries")
     p.add_argument("--original-wait-seconds", type=int, default=int(os.getenv("WECHAT_ORIGINAL_WAIT_SECONDS", "90")))
     p.add_argument("--temp-correlation-seconds", type=int, default=int(os.getenv("WECHAT_TEMP_CORRELATION_SECONDS", "30")))
+    p.add_argument("--thumb-candidates-enabled", default=os.getenv("WECHAT_THUMB_CANDIDATES_ENABLED", "false"))
     p.add_argument("--ui-force-download-enabled", default=os.getenv("WECHAT_UI_FORCE_DOWNLOAD_ENABLED", "false"))
     p.add_argument("--ui-force-delay-seconds", type=int, default=int(os.getenv("WECHAT_UI_FORCE_DELAY_SECONDS", "15")))
     p.add_argument("--ui-force-scope", default=os.getenv("WECHAT_UI_FORCE_SCOPE", "mapped-groups"))
@@ -4300,6 +4443,7 @@ def build_config(args: argparse.Namespace) -> Config:
         max_retries=max(0, args.max_retries),
         original_wait_seconds=max(30, int(args.original_wait_seconds)),
         temp_correlation_seconds=max(5, int(args.temp_correlation_seconds)),
+        thumb_candidates_enabled=parse_boolish(args.thumb_candidates_enabled, default=False),
         ui_force_download_enabled=parse_boolish(args.ui_force_download_enabled, default=False),
         ui_force_delay_seconds=max(5, int(args.ui_force_delay_seconds)),
         ui_force_scope=(str(args.ui_force_scope).strip().lower() or "mapped-groups"),
@@ -4367,6 +4511,7 @@ def main() -> int:
     print(f"DB merge path: {cfg.db_merge_path}")
     print(f"Original wait (seconds): {cfg.original_wait_seconds}")
     print(f"Temp correlation (seconds): {cfg.temp_correlation_seconds}")
+    print(f"Thumb candidates enabled: {cfg.thumb_candidates_enabled}")
     print(f"Verification column: {cfg.verification_column_name}")
     print(f"UI force download: {cfg.ui_force_download_enabled}")
     print(f"UI force delay (seconds): {cfg.ui_force_delay_seconds}")
@@ -4413,6 +4558,10 @@ def main() -> int:
     else:
         db.set_ui_force_runtime_enabled(False, release_waiting=False)
         db.start_manual_session()
+    if not cfg.thumb_candidates_enabled:
+        ignored_manual_open_only = db.ignore_manual_open_only_waits()
+        if ignored_manual_open_only:
+            print(f"[RECOVER] ignored_manual_open_only_waits={ignored_manual_open_only}")
     ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
     if ignored_old:
         print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
@@ -4458,11 +4607,12 @@ def main() -> int:
         print(str(exc))
         return 3
     print(f"OCR engine: {ocr.name}")
+    warmup_ocr_engine(ocr)
 
     observer: Optional[Observer] = None
     if WATCHDOG_AVAILABLE and not cfg.disable_watchdog:
         observer = Observer()
-        handler = IngestEventHandler(db, cfg.settle_seconds)
+        handler = IngestEventHandler(db, cfg.settle_seconds, cfg.thumb_candidates_enabled)
         for root in cfg.watch_roots:
             if root.exists():
                 observer.schedule(handler, str(root), recursive=True)

@@ -8,6 +8,7 @@ from wechat_receipt_daemon import (
     StateDB,
     WeChatMessageRef,
     backfill_missing_receipt_fields,
+    is_candidate,
     normalize_amount,
     normalize_client_label,
     parse_receipt_fields,
@@ -254,6 +255,60 @@ def build_receipt_payload(
     }
 
 
+def insert_file_row(
+    db: StateDB,
+    *,
+    file_id: str,
+    path: str,
+    source_kind: str,
+    status: str,
+    first_seen: float,
+    last_error: str | None,
+) -> None:
+    db._conn.execute(
+        """
+        INSERT INTO files(
+            file_id, path, source_kind, ext, size, mtime, ctime, status,
+            attempts, next_attempt, first_seen, last_seen, processed_at, sha256, last_error
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+        """,
+        (
+            file_id,
+            path,
+            source_kind,
+            Path(path).suffix.lower(),
+            10,
+            first_seen,
+            first_seen,
+            status,
+            1,
+            first_seen + 5.0,
+            first_seen,
+            first_seen,
+            last_error,
+        ),
+    )
+    db._conn.commit()
+
+
+class CandidateFilterTests(unittest.TestCase):
+    def test_thumb_is_ignored_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            thumb_path = root / "MsgAttach" / "gid" / "Thumb" / "2026-03" / "receipt_t.dat"
+            image_path = root / "MsgAttach" / "gid" / "Image" / "2026-03" / "receipt.dat"
+            temp_path = root / "FileStorage" / "Temp" / "receipt.png"
+            for path in (thumb_path, image_path, temp_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+
+            self.assertFalse(is_candidate(thumb_path, thumb_candidates_enabled=False))
+            self.assertTrue(is_candidate(thumb_path, thumb_candidates_enabled=True))
+            self.assertTrue(is_candidate(image_path, thumb_candidates_enabled=False))
+            self.assertTrue(is_candidate(temp_path, thumb_candidates_enabled=False))
+
+
 class ManualSessionOrderTests(unittest.TestCase):
     def test_manual_session_ignores_old_pending_message_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -294,6 +349,37 @@ class ManualSessionOrderTests(unittest.TestCase):
 
                 self.assertIsNotNone(blocker_without_session)
                 self.assertIsNone(blocker_with_session)
+            finally:
+                db.close()
+
+    def test_realtime_image_event_refreshes_manual_session_but_reconcile_does_not(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            image_path = root / "MsgAttach" / "gid" / "Image" / "2026-03" / "manual.dat"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(b"manual-open")
+
+            db = StateDB(root / "state.db")
+            try:
+                db.start_manual_session(100.0)
+
+                with patch("wechat_receipt_daemon.time.time", return_value=200.0):
+                    db.upsert_candidate(
+                        image_path,
+                        settle_seconds=5,
+                        source_event="reconcile",
+                        thumb_candidates_enabled=False,
+                    )
+                self.assertEqual(db.get_manual_session_started_at(), 100.0)
+
+                with patch("wechat_receipt_daemon.time.time", return_value=300.0):
+                    db.upsert_candidate(
+                        image_path,
+                        settle_seconds=5,
+                        source_event="modified",
+                        thumb_candidates_enabled=False,
+                    )
+                self.assertEqual(db.get_manual_session_started_at(), 300.0)
             finally:
                 db.close()
 
@@ -342,6 +428,99 @@ class ManualSessionOrderTests(unittest.TestCase):
                 self.assertIsNotNone(second_claim)
                 self.assertEqual(second_claim["file_id"], "current-b")
                 self.assertEqual(second_claim["row_payload"]["amount"], 700.0)
+            finally:
+                db.close()
+
+    def test_sink_claim_exposes_source_first_seen_for_latency_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="latency-file",
+                        ingested_at=2100.0,
+                        msg_svr_id="latency-msg",
+                        msg_create_time=400.0,
+                        amount=900.0,
+                        amount_rounded=900.0,
+                    )
+                )
+                insert_file_row(
+                    db,
+                    file_id="latency-file",
+                    path="C:/fake/latency-file.dat",
+                    source_kind="msgattach_image_dat",
+                    status="done",
+                    first_seen=2000.0,
+                    last_error=None,
+                )
+
+                claimed = db.claim_next_sink_receipt()
+
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed["source_first_seen"], 2000.0)
+                self.assertEqual(claimed["ingested_at"], 2100.0)
+            finally:
+                db.close()
+
+
+class ManualOpenOnlyCleanupTests(unittest.TestCase):
+    def test_cleanup_ignores_only_legacy_thumb_and_temp_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="thumb-wait",
+                    path="C:/fake/thumb-wait_t.dat",
+                    source_kind="msgattach_thumb_dat",
+                    status="retry",
+                    first_seen=1000.0,
+                    last_error="MANUAL_WAIT_ORIGINAL",
+                )
+                insert_file_row(
+                    db,
+                    file_id="temp-wait",
+                    path="C:/fake/temp-wait.png",
+                    source_kind="temp_image",
+                    status="pending",
+                    first_seen=1000.0,
+                    last_error="WAITING_TEMP_CONTEXT",
+                )
+                insert_file_row(
+                    db,
+                    file_id="image-keep",
+                    path="C:/fake/image-keep.dat",
+                    source_kind="msgattach_image_dat",
+                    status="retry",
+                    first_seen=1000.0,
+                    last_error="WAITING_ORIGINAL_MEDIA",
+                )
+                insert_file_row(
+                    db,
+                    file_id="temp-keep",
+                    path="C:/fake/temp-keep.png",
+                    source_kind="temp_image",
+                    status="retry",
+                    first_seen=1000.0,
+                    last_error="OTHER_REASON",
+                )
+
+                ignored = db.ignore_manual_open_only_waits()
+
+                self.assertEqual(ignored, 2)
+                rows = db._conn.execute(
+                    """
+                    SELECT file_id, status, last_error
+                    FROM files
+                    ORDER BY file_id ASC
+                    """
+                ).fetchall()
+                mapped = {row["file_id"]: (row["status"], row["last_error"]) for row in rows}
+                self.assertEqual(mapped["thumb-wait"], ("ignored", "IGNORED_MANUAL_OPEN_ONLY"))
+                self.assertEqual(mapped["temp-wait"], ("ignored", "IGNORED_MANUAL_OPEN_ONLY"))
+                self.assertEqual(mapped["image-keep"], ("retry", "WAITING_ORIGINAL_MEDIA"))
+                self.assertEqual(mapped["temp-keep"], ("retry", "OTHER_REASON"))
             finally:
                 db.close()
 
