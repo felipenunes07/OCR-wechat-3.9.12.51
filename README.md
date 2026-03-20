@@ -1,11 +1,11 @@
 # WeChat OCR Auto
 
-Automacao para monitorar imagens de comprovantes do WeChat Desktop, extrair dados com OCR e gravar no Excel.
+Automacao para monitorar imagens de comprovantes do WeChat Desktop, extrair dados com OCR e gravar no destino configurado.
 
 ## O que este projeto faz
 - Monitora `WeChat Files/.../FileStorage` em tempo real.
 - Processa novas imagens/comprovantes.
-- Extrai campos para Excel:
+- Extrai campos para planilha:
   - `CLIENTE`
   - `DATA`
   - `HORA`
@@ -21,6 +21,7 @@ Automacao para monitorar imagens de comprovantes do WeChat Desktop, extrair dado
 - `STATUS_WECHAT_OCR_AO_VIVO.cmd` -> status em loop.
 - `refresh_group_map.py` -> atualiza mapeamento hash->nome de grupo.
 - `clientes_grupos.template.json` -> template de mapeamento.
+- `sink_config.json` -> define se grava em Excel ou Google Sheets.
 
 ## OCR usado
 - Padrao: `rapidocr-onnxruntime` (gratuito, Apache-2.0).
@@ -43,6 +44,13 @@ pip install -r requirements.txt
 Copy-Item .\clientes_grupos.template.json .\clientes_grupos.json
 python -X utf8 .\refresh_group_map.py
 ```
+
+5. Se quiser usar Google Sheets:
+
+- Edite `sink_config.json` com a URL/id da planilha.
+- Opcional: ajuste `recent_files_hours` para limitar a varredura inicial aos arquivos mais recentes.
+- Coloque o JSON da service account em `.\google_service_account.json`.
+- Compartilhe a planilha com o e-mail da service account como `Editor`.
 
 ## Executar
 ```powershell
@@ -87,5 +95,6 @@ git push -u origin main
   - logs
   - excel gerado
   - `clientes_grupos.json` real (dados privados)
+  - `google_service_account.json`
   - pasta `decrypted_msg`
 - O template `clientes_grupos.template.json` pode ser versionado sem dados sensiveis.

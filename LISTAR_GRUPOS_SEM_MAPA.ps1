@@ -4,10 +4,14 @@ if (!(Test-Path $db)) {
   Write-Output "DB nao encontrado: $db"
   exit 1
 }
+$pyExe = Join-Path $dir ".venv\\Scripts\\python.exe"
+if (!(Test-Path $pyExe)) { $pyExe = "python" }
+
 $py = @"
 import sqlite3
 from collections import Counter
-p = r'''$db'''
+from pathlib import Path
+p = Path("wechat_receipt_state.db").resolve()
 conn = sqlite3.connect(p)
 cur = conn.cursor()
 rows = cur.execute("SELECT last_error FROM files WHERE last_error LIKE 'MISSING_CLIENT_MAP:%' AND status IN ('pending','retry','processing')").fetchall()
@@ -20,5 +24,9 @@ for gid, n in ctr.most_common(50):
     print(f"{gid} | pendentes={n}")
 conn.close()
 "@
-$py | python -
-
+Push-Location $dir
+try {
+  $py | & $pyExe -X utf8 -
+} finally {
+  Pop-Location
+}

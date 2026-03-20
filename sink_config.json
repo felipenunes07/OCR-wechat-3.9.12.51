@@ -1,0 +1,19 @@
+{
+  "sink_mode": "google-sheets",
+  "spreadsheet_url": "https://docs.google.com/spreadsheets/d/14_O2qiXu-TYAhz2LeG0wEmjxxaNDpyU16CQiuo0Wf8c/edit?usp=sharing",
+  "worksheet": "",
+  "review_worksheet": "Revisar",
+  "google_credentials_path": "google_service_account.json",
+  "original_wait_seconds": 90,
+  "temp_correlation_seconds": 30,
+  "db_merge_path": ".runtime\\wechat_merge.db",
+  "verification_column_name": "STATUS_VERIFICACAO",
+  "resolution_mode": "db-first",
+  "ui_force_download_enabled": true,
+  "ui_force_delay_seconds": 15,
+  "ui_force_scope": "mapped-groups",
+  "ui_focus_policy": "immediate",
+  "ui_batch_mode": "group-sequential",
+  "ui_item_timeout_seconds": 5,
+  "ui_retry_backoff_seconds": [5, 10, 20, 40]
+}

@@ -9,18 +9,31 @@ import sqlite3
 import pywxdump
 
 
-def pick_group_name(remark: str | None, nickname: str | None, username: str) -> str:
+def stable_hash(value: str) -> str:
+    return hashlib.md5(value.encode("utf-8")).hexdigest()
+
+
+def pick_group_name(
+    session_name: str | None,
+    remark: str | None,
+    nickname: str | None,
+    username: str,
+) -> str:
     r = (remark or '').strip()
-    n = (nickname or '').strip()
+    s = (session_name or '').strip()
     if r:
         return r
+    if s:
+        return s
+    n = (nickname or '').strip()
     if n:
         return n
     return username
 
 
 def main() -> int:
-    base_dir = Path(r"C:\Users\admin\Desktop\WeChat_OCR_Auto")
+    # Keep all generated artifacts inside the project folder so it works on any PC/user.
+    base_dir = Path(__file__).resolve().parent
     map_path = base_dir / "clientes_grupos.json"
     dec_dir = base_dir / "decrypted_msg"
     dec_dir.mkdir(parents=True, exist_ok=True)
@@ -50,19 +63,46 @@ def main() -> int:
 
     conn = sqlite3.connect(de_micro)
     cur = conn.cursor()
-    rows = cur.execute(
+    contact_rows = cur.execute(
         "SELECT UserName, NickName, Remark FROM Contact WHERE UserName LIKE '%@chatroom'"
     ).fetchall()
+    session_rows = cur.execute(
+        "SELECT strUsrName, strNickName, nTime FROM Session WHERE strUsrName LIKE '%@chatroom'"
+    ).fetchall()
+    non_group_usernames = {
+        username
+        for (username,) in cur.execute(
+            "SELECT UserName FROM Contact WHERE UserName NOT LIKE '%@chatroom' AND UserName != ''"
+        ).fetchall()
+        if username
+    }
+    non_group_usernames.update(
+        username
+        for (username,) in cur.execute(
+            "SELECT strUsrName FROM Session WHERE strUsrName NOT LIKE '%@chatroom' AND strUsrName != ''"
+        ).fetchall()
+        if username
+    )
     conn.close()
 
-    auto_map: dict[str, str] = {}
-    for username, nickname, remark in rows:
+    session_name_by_username: dict[str, tuple[int, str]] = {}
+    for username, session_name, ntime in session_rows:
         if not username:
             continue
-        h = hashlib.md5(username.encode("utf-8")).hexdigest()
-        if folder_hashes and h not in folder_hashes:
+        ts = int(ntime or 0)
+        old = session_name_by_username.get(username)
+        if old is None or ts >= old[0]:
+            session_name_by_username[username] = (ts, (session_name or "").strip())
+
+    auto_map: dict[str, str] = {}
+    for username, nickname, remark in contact_rows:
+        if not username:
             continue
-        auto_map[h] = pick_group_name(remark, nickname, username)
+        h = stable_hash(username)
+        session_name = session_name_by_username.get(username, (0, ""))[1]
+        auto_map[h] = pick_group_name(session_name, remark, nickname, username)
+
+    non_group_hashes = {stable_hash(username).lower() for username in non_group_usernames}
 
     existing: dict[str, str] = {}
     if map_path.exists():
@@ -83,9 +123,14 @@ def main() -> int:
             changed += 1
 
     for h in sorted(folder_hashes):
+        if h in auto_map or h in non_group_hashes:
+            continue
         existing.setdefault(h, "")
 
     existing.pop("cole_aqui_id_do_grupo", None)
+    for h in non_group_hashes:
+        if not existing.get(h, "").strip():
+            existing.pop(h, None)
     map_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
 
     filled = sum(1 for v in existing.values() if str(v).strip())

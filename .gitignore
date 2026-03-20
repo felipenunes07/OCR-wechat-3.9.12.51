@@ -18,9 +18,13 @@ pagamentos_wechat_legacy_*.xlsx
 
 # Local/private mapping (contains real group names)
 clientes_grupos.json
+google_service_account.json
 
 # Large local decrypted artifacts
 decrypted_msg/
+.runtime/
+debug_*.jpg
+smoke_daemon.*.log
 
 # Editor / OS
 .DS_Store
