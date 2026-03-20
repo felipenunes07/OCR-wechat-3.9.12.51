@@ -1007,7 +1007,7 @@ class StateDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -1061,9 +1061,15 @@ class StateDB:
                     parser_json TEXT,
                     msg_svr_id TEXT,
                     talker TEXT,
+                    msg_create_time REAL,
                     resolved_media_path TEXT,
                     resolution_source TEXT,
                     verification_status TEXT,
+                    sheet_status TEXT,
+                    sheet_payload_json TEXT,
+                    sheet_next_attempt REAL,
+                    sheet_last_error TEXT,
+                    sheet_committed_at REAL,
                     excel_sheet TEXT,
                     excel_row INTEGER
                 );
@@ -1095,14 +1101,40 @@ class StateDB:
             self._ensure_column_exists(cur, "receipts", "bank", "TEXT")
             self._ensure_column_exists(cur, "receipts", "msg_svr_id", "TEXT")
             self._ensure_column_exists(cur, "receipts", "talker", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "msg_create_time", "REAL")
             self._ensure_column_exists(cur, "receipts", "resolved_media_path", "TEXT")
             self._ensure_column_exists(cur, "receipts", "resolution_source", "TEXT")
             self._ensure_column_exists(cur, "receipts", "verification_status", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "sheet_status", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "sheet_payload_json", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "sheet_next_attempt", "REAL")
+            self._ensure_column_exists(cur, "receipts", "sheet_last_error", "TEXT")
+            self._ensure_column_exists(cur, "receipts", "sheet_committed_at", "REAL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sha256 ON receipts(sha256)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_msg_svr_id ON receipts(msg_svr_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_sheet_status_next ON receipts(sheet_status, sheet_next_attempt, msg_create_time)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_talker_msg_order ON receipts(talker, msg_create_time, msg_svr_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_state_next ON message_jobs(state, next_ui_attempt_at, first_seen_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_talker_state ON message_jobs(talker, state, create_time DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_message_jobs_expected_path ON message_jobs(expected_image_path)")
+            cur.execute(
+                """
+                UPDATE receipts
+                SET sheet_status=CASE
+                        WHEN sheet_status IS NULL OR sheet_status='' THEN
+                            CASE
+                                WHEN excel_row IS NOT NULL THEN 'SINK_COMMITTED'
+                                ELSE 'SINK_PENDING'
+                            END
+                        ELSE sheet_status
+                    END,
+                    sheet_next_attempt=COALESCE(sheet_next_attempt, 0),
+                    sheet_committed_at=CASE
+                        WHEN sheet_committed_at IS NULL AND excel_row IS NOT NULL THEN ingested_at
+                        ELSE sheet_committed_at
+                    END
+                """
+            )
             self._conn.commit()
 
     @staticmethod
@@ -1355,11 +1387,18 @@ class StateDB:
             cur.execute("BEGIN IMMEDIATE")
             row = cur.execute(
                 """
-                SELECT file_id, path, source_kind, ext, size, mtime, first_seen, attempts
-                FROM files
-                WHERE status IN ('pending', 'retry')
-                  AND next_attempt <= ?
-                ORDER BY mtime DESC, next_attempt ASC
+                SELECT f.file_id, f.path, f.source_kind, f.ext, f.size, f.mtime, f.first_seen, f.attempts
+                FROM files AS f
+                LEFT JOIN message_jobs AS mj
+                  ON mj.thumb_path=f.path OR mj.expected_image_path=f.path
+                WHERE f.status IN ('pending', 'retry')
+                  AND f.next_attempt <= ?
+                ORDER BY
+                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN 0 ELSE 1 END ASC,
+                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.create_time END ASC,
+                    CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.msg_svr_id END ASC,
+                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.mtime END DESC,
+                    f.next_attempt ASC
                 LIMIT 1
                 """,
                 (float(now),),
@@ -1631,11 +1670,12 @@ class StateDB:
                     file_id, source_path, source_kind, ingested_at, sha256,
                     txn_date, txn_time, client, bank, beneficiary, amount, currency,
                     parse_conf, quality_score, ocr_engine, ocr_conf, ocr_chars,
-                    review_needed, ocr_text, parser_json, msg_svr_id, talker,
+                    review_needed, ocr_text, parser_json, msg_svr_id, talker, msg_create_time,
                     resolved_media_path, resolution_source, verification_status,
+                    sheet_status, sheet_payload_json, sheet_next_attempt, sheet_last_error, sheet_committed_at,
                     excel_sheet, excel_row
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     payload["file_id"],
@@ -1660,12 +1700,204 @@ class StateDB:
                     payload.get("parser_json"),
                     payload.get("msg_svr_id"),
                     payload.get("talker"),
+                    payload.get("msg_create_time"),
                     payload.get("resolved_media_path"),
                     payload.get("resolution_source"),
                     payload.get("verification_status"),
+                    payload.get("sheet_status"),
+                    payload.get("sheet_payload_json"),
+                    payload.get("sheet_next_attempt"),
+                    payload.get("sheet_last_error"),
+                    payload.get("sheet_committed_at"),
                     payload.get("excel_sheet"),
                     payload.get("excel_row"),
                 ),
+            )
+            self._conn.commit()
+
+    @staticmethod
+    def _receipt_message_sort_key(msg_svr_id: Optional[str], file_id: str) -> str:
+        msg_value = str(msg_svr_id or "").strip()
+        if msg_value:
+            return msg_value
+        return f"file:{str(file_id)}"
+
+    def find_prior_pending_sink_receipt(
+        self,
+        talker: Optional[str],
+        msg_create_time: float,
+        msg_svr_id: Optional[str],
+        file_id: str,
+    ) -> Optional[sqlite3.Row]:
+        talker_value = str(talker or "").strip()
+        if not talker_value or msg_create_time <= 0:
+            return None
+        sort_key = self._receipt_message_sort_key(msg_svr_id, file_id)
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT file_id, msg_svr_id, msg_create_time, sheet_status
+                FROM receipts
+                WHERE talker=?
+                  AND file_id<>?
+                  AND msg_create_time IS NOT NULL
+                  AND msg_create_time > 0
+                  AND COALESCE(sheet_status, '') NOT IN ('SINK_COMMITTED', 'SINK_SKIPPED_TERMINAL')
+                  AND (
+                    msg_create_time < ?
+                    OR (
+                      msg_create_time = ?
+                      AND COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) < ?
+                    )
+                  )
+                ORDER BY msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC
+                LIMIT 1
+                """,
+                (talker_value, str(file_id), float(msg_create_time), float(msg_create_time), sort_key),
+            ).fetchone()
+
+    def claim_next_sink_receipt(
+        self,
+        sheet_order_scope: str = "per_talker",
+        commit_order: str = "asc",
+    ) -> Optional[dict[str, Any]]:
+        now = time.time()
+        scope = str(sheet_order_scope or "per_talker").strip().lower() or "per_talker"
+        order = str(commit_order or "asc").strip().lower() or "asc"
+        order_by = "msg_create_time ASC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) ASC"
+        if order == "desc":
+            order_by = "msg_create_time DESC, COALESCE(NULLIF(msg_svr_id, ''), 'file:' || file_id) DESC"
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            rows = cur.execute(
+                f"""
+                SELECT file_id, source_path, ingested_at, review_needed, msg_svr_id, talker,
+                       msg_create_time, client, txn_date, txn_time, bank, amount, verification_status,
+                       sheet_payload_json, sheet_status
+                FROM receipts
+                WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
+                  AND COALESCE(sheet_next_attempt, 0) <= ?
+                ORDER BY
+                    CASE
+                        WHEN talker IS NOT NULL AND talker <> '' AND msg_create_time IS NOT NULL AND msg_create_time > 0
+                            THEN 0
+                        ELSE 1
+                    END ASC,
+                    {order_by},
+                    ingested_at ASC
+                """,
+                (float(now),),
+            ).fetchall()
+
+            for row in rows:
+                file_id = str(row["file_id"])
+                msg_svr_id = str(row["msg_svr_id"] or "").strip() or None
+                talker = str(row["talker"] or "").strip() or None
+                msg_create_time = float(row["msg_create_time"] or 0.0)
+                blocker_note: Optional[str] = None
+                if scope == "per_talker" and talker and msg_create_time > 0:
+                    prior_sink = self.find_prior_pending_sink_receipt(
+                        talker=talker,
+                        msg_create_time=msg_create_time,
+                        msg_svr_id=msg_svr_id,
+                        file_id=file_id,
+                    )
+                    if prior_sink is not None:
+                        blocker_id = self._receipt_message_sort_key(prior_sink["msg_svr_id"], str(prior_sink["file_id"]))
+                        blocker_note = f"WAITING_PRIOR_SINK_RECEIPT:{blocker_id}"
+                    elif msg_svr_id:
+                        prior_job = self.find_prior_pending_message_job(
+                            talker=talker,
+                            create_time=msg_create_time,
+                            msg_svr_id=msg_svr_id,
+                        )
+                        if prior_job is not None:
+                            blocker_note = f"WAITING_PRIOR_SINK_MESSAGE:{str(prior_job['msg_svr_id'])}"
+
+                if blocker_note:
+                    cur.execute(
+                        """
+                        UPDATE receipts
+                        SET sheet_status='SINK_BLOCKED_PRIOR_MSG',
+                            sheet_last_error=?
+                        WHERE file_id=?
+                        """,
+                        (blocker_note[:1200], file_id),
+                    )
+                    continue
+
+                cur.execute(
+                    """
+                    UPDATE receipts
+                    SET sheet_status='SINK_RUNNING',
+                        sheet_last_error=NULL
+                    WHERE file_id=?
+                    """,
+                    (file_id,),
+                )
+                self._conn.commit()
+
+                payload_json = str(row["sheet_payload_json"] or "").strip()
+                try:
+                    payload: dict[str, Any] = json.loads(payload_json) if payload_json else {}
+                except Exception:
+                    payload = {}
+                if not payload:
+                    payload = {
+                        "file_id": file_id,
+                        "client": row["client"],
+                        "txn_date": row["txn_date"],
+                        "txn_time": row["txn_time"],
+                        "bank": row["bank"],
+                        "amount": row["amount"],
+                        "verification_status": row["verification_status"],
+                        "msg_svr_id": msg_svr_id,
+                        "talker": talker,
+                    }
+                return {
+                    "file_id": file_id,
+                    "source_path": str(row["source_path"]),
+                    "review_needed": bool(row["review_needed"]),
+                    "msg_svr_id": msg_svr_id,
+                    "talker": talker,
+                    "msg_create_time": msg_create_time,
+                    "row_payload": payload,
+                }
+
+            self._conn.commit()
+            return None
+
+    def mark_receipt_sink_committed(self, file_id: str, sheet_name: str, row_idx: int, committed_at: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE receipts
+                SET sheet_status='SINK_COMMITTED',
+                    sheet_committed_at=?,
+                    sheet_next_attempt=0,
+                    sheet_last_error=NULL,
+                    excel_sheet=?,
+                    excel_row=?
+                WHERE file_id=?
+                """,
+                (float(committed_at), str(sheet_name), int(row_idx), str(file_id)),
+            )
+            self._conn.commit()
+
+    def mark_receipt_sink_retry(self, file_id: str, err: str, delay_sec: int) -> None:
+        next_attempt = time.time() + max(5, int(delay_sec))
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE receipts
+                SET sheet_status='SINK_RETRY',
+                    sheet_next_attempt=?,
+                    sheet_last_error=?
+                WHERE file_id=?
+                """,
+                (float(next_attempt), err[:1200], str(file_id)),
             )
             self._conn.commit()
 
@@ -1938,8 +2170,12 @@ class StateDB:
             return
         self.set_meta("last_msg_cursor", f"{int(create_time)}|{str(msg_svr_id or '').strip()}")
 
-    def claim_ui_batch(self) -> tuple[Optional[str], list[dict[str, Any]]]:
+    def claim_ui_batch(self, materialization_order: str = "desc") -> tuple[Optional[str], list[dict[str, Any]]]:
         now = time.time()
+        order = str(materialization_order or "desc").strip().lower() or "desc"
+        order_by = "create_time DESC, msg_svr_id DESC"
+        if order == "asc":
+            order_by = "create_time ASC, msg_svr_id ASC"
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
@@ -1963,7 +2199,7 @@ class StateDB:
 
             talker = str(talker_row["talker"])
             rows = cur.execute(
-                """
+                f"""
                 SELECT msg_svr_id, talker, talker_display, expected_image_path, thumb_path, create_time, ui_force_attempts
                 FROM message_jobs
                 WHERE talker=?
@@ -1972,7 +2208,7 @@ class StateDB:
                   AND talker_display IS NOT NULL
                   AND expected_image_path IS NOT NULL
                   AND thumb_path IS NOT NULL
-                ORDER BY create_time DESC, msg_svr_id DESC
+                ORDER BY {order_by}
                 """,
                 (talker, float(now)),
             ).fetchall()
@@ -2379,6 +2615,11 @@ class Config:
     ui_batch_mode: str
     ui_item_timeout_seconds: int
     ui_retry_backoff_seconds: list[int]
+    ui_window_backends: list[str]
+    ui_window_classes: list[str]
+    sheet_order_scope: str
+    sheet_materialization_order: str
+    sheet_commit_order: str
     disable_watchdog: bool
 
 
@@ -2456,6 +2697,8 @@ class UIForceDownloadWorker(threading.Thread):
             WeChatUIForceDownloader(
                 focus_policy=cfg.ui_focus_policy,
                 item_timeout_seconds=cfg.ui_item_timeout_seconds,
+                window_backends=cfg.ui_window_backends,
+                window_class_candidates=cfg.ui_window_classes,
             )
             if self.available
             else None
@@ -2467,7 +2710,7 @@ class UIForceDownloadWorker(threading.Thread):
 
         while not self.stop_event.is_set():
             try:
-                batch_id, jobs = self.db.claim_ui_batch()
+                batch_id, jobs = self.db.claim_ui_batch(materialization_order=self.cfg.sheet_materialization_order)
             except Exception as exc:
                 note = f"ui_claim_failed:{type(exc).__name__}:{exc}"
                 self.db.set_meta("last_ui_result", note)
@@ -2859,15 +3102,20 @@ def process_item(
             "parser_json": json.dumps(fields, ensure_ascii=False),
             "msg_svr_id": msg_svr_id,
             "talker": resolution.msg_ref.talker if resolution.msg_ref is not None else None,
+            "msg_create_time": resolution.msg_ref.create_time if resolution.msg_ref is not None else None,
             "resolved_media_path": str(path),
             "resolution_source": resolution.resolution_source,
             "verification_status": resolution.verification_status,
-            "error": None,
         }
 
-        sheet, row = sink.append(payload, review_needed=review_needed)
-        payload["excel_sheet"] = sheet
-        payload["excel_row"] = row
+        row_payload = dict(payload)
+        payload["sheet_status"] = "SINK_PENDING"
+        payload["sheet_payload_json"] = json.dumps(row_payload, ensure_ascii=False)
+        payload["sheet_next_attempt"] = 0.0
+        payload["sheet_last_error"] = None
+        payload["sheet_committed_at"] = None
+        payload["excel_sheet"] = None
+        payload["excel_row"] = None
         db.insert_receipt(payload)
         db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
         db.resolve_related_file_paths(
@@ -2885,7 +3133,7 @@ def process_item(
 
         print(
             f"[OK] {path.name} | cliente={client} | banco={bank} | valor={fields['amount']} "
-            f"| data={fields['txn_date']} {fields['txn_time']} | sheet={sheet} "
+            f"| data={fields['txn_date']} {fields['txn_time']} | sink=staged "
             f"| resolution={resolution.resolution_source} | verification={resolution.verification_status}"
         )
 
@@ -2908,6 +3156,38 @@ def process_item(
             delay_override_sec=fast_retry,
         )
         print(f"[RETRY] {path.name} | attempt={item.attempts} | err={type(exc).__name__}: {exc}")
+
+
+def flush_ready_sink_rows(db: StateDB, sink: RowSink, cfg: Config, max_rows: int = 50) -> int:
+    committed = 0
+    limit = max(1, int(max_rows))
+    for _ in range(limit):
+        claimed = db.claim_next_sink_receipt(
+            sheet_order_scope=cfg.sheet_order_scope,
+            commit_order=cfg.sheet_commit_order,
+        )
+        if claimed is None:
+            break
+
+        file_id = str(claimed["file_id"])
+        msg_svr_id = str(claimed.get("msg_svr_id") or "").strip() or "-"
+        talker = str(claimed.get("talker") or "").strip() or "-"
+        msg_create_time = float(claimed.get("msg_create_time") or 0.0)
+        try:
+            sheet, row = sink.append(claimed["row_payload"], review_needed=bool(claimed["review_needed"]))
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            db.mark_receipt_sink_retry(file_id, err, delay_sec=cfg.retry_base_seconds)
+            print(f"[SINK] retry | file_id={file_id} | msg={msg_svr_id} | talker={talker} | err={err}")
+            break
+
+        db.mark_receipt_sink_committed(file_id, sheet, row, committed_at=time.time())
+        committed += 1
+        print(
+            f"[SINK] committed | file_id={file_id} | msg={msg_svr_id} | talker={talker} "
+            f"| create_time={msg_create_time:.0f} | sheet={sheet} | row={row}"
+        )
+    return committed
 
 
 def default_watch_roots() -> list[Path]:
@@ -2950,6 +3230,26 @@ def parse_retry_backoff_seconds(value: Any) -> list[int]:
         if ivalue > 0:
             out.append(ivalue)
     return out or [5, 10, 20, 40]
+
+
+def parse_token_list(value: Any, default: list[str]) -> list[str]:
+    if isinstance(value, list):
+        raw_parts = value
+    else:
+        raw_parts = re.split(r"[\s,;]+", str(value or "").strip())
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        token = str(part or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        out.append(token)
+        seen.add(key)
+    return out or list(default)
 
 
 def ensure_client_map_file(map_path: Path, watch_roots: list[Path]) -> None:
@@ -3011,6 +3311,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ui-batch-mode", default=os.getenv("WECHAT_UI_BATCH_MODE", "group-sequential"))
     p.add_argument("--ui-item-timeout-seconds", type=int, default=int(os.getenv("WECHAT_UI_ITEM_TIMEOUT_SECONDS", "5")))
     p.add_argument("--ui-retry-backoff-seconds", default=os.getenv("WECHAT_UI_RETRY_BACKOFF_SECONDS", "5,10,20,40"))
+    p.add_argument("--ui-window-backends", default=os.getenv("WECHAT_UI_WINDOW_BACKENDS", "win32,uia"))
+    p.add_argument("--ui-window-classes", default=os.getenv("WECHAT_UI_WINDOW_CLASSES", "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_0"))
+    p.add_argument("--sheet-order-scope", default=os.getenv("WECHAT_SHEET_ORDER_SCOPE", "per_talker"))
+    p.add_argument("--sheet-materialization-order", default=os.getenv("WECHAT_SHEET_MATERIALIZATION_ORDER", "desc"))
+    p.add_argument("--sheet-commit-order", default=os.getenv("WECHAT_SHEET_COMMIT_ORDER", "asc"))
     p.add_argument("--disable-watchdog", action="store_true")
     return p.parse_args()
 
@@ -3046,6 +3351,14 @@ def build_config(args: argparse.Namespace) -> Config:
         ui_batch_mode=(str(args.ui_batch_mode).strip().lower() or "group-sequential"),
         ui_item_timeout_seconds=max(1, int(args.ui_item_timeout_seconds)),
         ui_retry_backoff_seconds=parse_retry_backoff_seconds(args.ui_retry_backoff_seconds),
+        ui_window_backends=[token.lower() for token in parse_token_list(args.ui_window_backends, ["win32", "uia"])],
+        ui_window_classes=parse_token_list(
+            args.ui_window_classes,
+            ["WeChatMainWndForPC", "Base_PowerMessageWindow", "Chrome_WidgetWin_0"],
+        ),
+        sheet_order_scope=(str(args.sheet_order_scope).strip().lower() or "per_talker"),
+        sheet_materialization_order=(str(args.sheet_materialization_order).strip().lower() or "desc"),
+        sheet_commit_order=(str(args.sheet_commit_order).strip().lower() or "asc"),
         disable_watchdog=bool(args.disable_watchdog),
     )
 
@@ -3106,6 +3419,11 @@ def main() -> int:
     print(f"UI batch mode: {cfg.ui_batch_mode}")
     print(f"UI item timeout (seconds): {cfg.ui_item_timeout_seconds}")
     print(f"UI retry backoff (seconds): {cfg.ui_retry_backoff_seconds}")
+    print(f"UI window backends: {cfg.ui_window_backends}")
+    print(f"UI window classes: {cfg.ui_window_classes}")
+    print(f"Sheet order scope: {cfg.sheet_order_scope}")
+    print(f"Sheet materialization order: {cfg.sheet_materialization_order}")
+    print(f"Sheet commit order: {cfg.sheet_commit_order}")
     if cfg.ui_force_download_enabled:
         if not UI_FORCE_DOWNLOADER_AVAILABLE or WeChatUIForceDownloader is None:
             err = UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable"
@@ -3115,6 +3433,8 @@ def main() -> int:
                 ui_probe = WeChatUIForceDownloader(
                     focus_policy=cfg.ui_focus_policy,
                     item_timeout_seconds=cfg.ui_item_timeout_seconds,
+                    window_backends=cfg.ui_window_backends,
+                    window_class_candidates=cfg.ui_window_classes,
                 )
                 probe_ok, probe_note = ui_probe.probe_main_window()
                 if probe_ok:
@@ -3202,8 +3522,10 @@ def main() -> int:
                 last_reconcile = now
                 print(f"[SCAN] reconcile complete | queued_or_refreshed={added}")
 
+            flush_ready_sink_rows(db, sink, cfg, max_rows=50)
             item = db.claim_next()
             if item is None:
+                flush_ready_sink_rows(db, sink, cfg, max_rows=50)
                 time.sleep(cfg.idle_sleep_seconds)
                 continue
             process_item(
@@ -3215,6 +3537,7 @@ def main() -> int:
                 media_resolver=media_resolver,
                 cfg=cfg,
             )
+            flush_ready_sink_rows(db, sink, cfg, max_rows=50)
     except KeyboardInterrupt:
         print("Stopping daemon...")
     finally:

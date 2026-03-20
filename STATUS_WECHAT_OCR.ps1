@@ -61,6 +61,16 @@ if (Test-Path $sinkConfigPath) {
     if ($uiItemTimeoutSeconds -le 0) { $uiItemTimeoutSeconds = 5 }
     $uiRetryBackoffSeconds = ($sinkConfig.ui_retry_backoff_seconds | ForEach-Object { [string]$_ }) -join ","
     if ([string]::IsNullOrWhiteSpace($uiRetryBackoffSeconds)) { $uiRetryBackoffSeconds = "5,10,20,40" }
+    $uiWindowBackends = ($sinkConfig.ui_window_backends | ForEach-Object { [string]$_ }) -join ","
+    if ([string]::IsNullOrWhiteSpace($uiWindowBackends)) { $uiWindowBackends = "win32,uia" }
+    $uiWindowClasses = ($sinkConfig.ui_window_classes | ForEach-Object { [string]$_ }) -join ","
+    if ([string]::IsNullOrWhiteSpace($uiWindowClasses)) { $uiWindowClasses = "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_0" }
+    $sheetOrderScope = [string]($sinkConfig.sheet_order_scope)
+    if ([string]::IsNullOrWhiteSpace($sheetOrderScope)) { $sheetOrderScope = "per_talker" }
+    $sheetMaterializationOrder = [string]($sinkConfig.sheet_materialization_order)
+    if ([string]::IsNullOrWhiteSpace($sheetMaterializationOrder)) { $sheetMaterializationOrder = "desc" }
+    $sheetCommitOrder = [string]($sinkConfig.sheet_commit_order)
+    if ([string]::IsNullOrWhiteSpace($sheetCommitOrder)) { $sheetCommitOrder = "asc" }
     Write-Output "GOOGLE_SHEETS_REF=$gsheetRef"
     Write-Output "GOOGLE_CREDENTIALS=$googleCredentialsPath"
     Write-Output "GOOGLE_CREDENTIALS_OK=$(Test-Path $googleCredentialsPath)"
@@ -77,6 +87,11 @@ if (Test-Path $sinkConfigPath) {
     Write-Output "UI_BATCH_MODE=$uiBatchMode"
     Write-Output "UI_ITEM_TIMEOUT_SECONDS=$uiItemTimeoutSeconds"
     Write-Output "UI_RETRY_BACKOFF_SECONDS=$uiRetryBackoffSeconds"
+    Write-Output "UI_WINDOW_BACKENDS=$uiWindowBackends"
+    Write-Output "UI_WINDOW_CLASSES=$uiWindowClasses"
+    Write-Output "SHEET_ORDER_SCOPE=$sheetOrderScope"
+    Write-Output "SHEET_MATERIALIZATION_ORDER=$sheetMaterializationOrder"
+    Write-Output "SHEET_COMMIT_ORDER=$sheetCommitOrder"
   } else {
     Write-Output "EXCEL=$excel"
   }

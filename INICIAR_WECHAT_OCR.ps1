@@ -58,6 +58,11 @@ $uiFocusPolicy = "immediate"
 $uiBatchMode = "group-sequential"
 $uiItemTimeoutSeconds = 5
 $uiRetryBackoffSeconds = "5,10,20,40"
+$uiWindowBackends = "win32,uia"
+$uiWindowClasses = "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_0"
+$sheetOrderScope = "per_talker"
+$sheetMaterializationOrder = "desc"
+$sheetCommitOrder = "asc"
 $dbMergePath = Join-Path $dir ".runtime\\wechat_merge.db"
 $googleCredentialsPath = Join-Path $dir "google_service_account.json"
 if (Test-Path $sinkConfigPath) {
@@ -79,6 +84,11 @@ if (Test-Path $sinkConfigPath) {
   if ($sinkConfig.ui_batch_mode) { $uiBatchMode = [string]$sinkConfig.ui_batch_mode }
   if ($sinkConfig.ui_item_timeout_seconds) { $uiItemTimeoutSeconds = [int]$sinkConfig.ui_item_timeout_seconds }
   if ($sinkConfig.ui_retry_backoff_seconds) { $uiRetryBackoffSeconds = (($sinkConfig.ui_retry_backoff_seconds | ForEach-Object { [string]$_ }) -join ",") }
+  if ($sinkConfig.ui_window_backends) { $uiWindowBackends = (($sinkConfig.ui_window_backends | ForEach-Object { [string]$_ }) -join ",") }
+  if ($sinkConfig.ui_window_classes) { $uiWindowClasses = (($sinkConfig.ui_window_classes | ForEach-Object { [string]$_ }) -join ",") }
+  if ($sinkConfig.sheet_order_scope) { $sheetOrderScope = [string]$sinkConfig.sheet_order_scope }
+  if ($sinkConfig.sheet_materialization_order) { $sheetMaterializationOrder = [string]$sinkConfig.sheet_materialization_order }
+  if ($sinkConfig.sheet_commit_order) { $sheetCommitOrder = [string]$sinkConfig.sheet_commit_order }
   if ($sinkConfig.db_merge_path) { $dbMergePath = [string]$sinkConfig.db_merge_path }
   if ($sinkConfig.google_credentials_path) {
     $googleCredentialsPath = [string]$sinkConfig.google_credentials_path
@@ -128,6 +138,11 @@ $arguments = @(
   "--ui-batch-mode", $uiBatchMode,
   "--ui-item-timeout-seconds", "$uiItemTimeoutSeconds",
   "--ui-retry-backoff-seconds", $uiRetryBackoffSeconds,
+  "--ui-window-backends", $uiWindowBackends,
+  "--ui-window-classes", $uiWindowClasses,
+  "--sheet-order-scope", $sheetOrderScope,
+  "--sheet-materialization-order", $sheetMaterializationOrder,
+  "--sheet-commit-order", $sheetCommitOrder,
   "--client-map-path", (Join-Path $dir "clientes_grupos.json")
 )
 
@@ -166,6 +181,11 @@ if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {
   Write-Output "DB_MERGE_PATH=$dbMergePath"
   Write-Output "UI_FORCE_DOWNLOAD_ENABLED=$uiForceDownloadEnabled"
   Write-Output "UI_FORCE_DELAY_SECONDS=$uiForceDelaySeconds"
+  Write-Output "UI_WINDOW_BACKENDS=$uiWindowBackends"
+  Write-Output "UI_WINDOW_CLASSES=$uiWindowClasses"
+  Write-Output "SHEET_ORDER_SCOPE=$sheetOrderScope"
+  Write-Output "SHEET_MATERIALIZATION_ORDER=$sheetMaterializationOrder"
+  Write-Output "SHEET_COMMIT_ORDER=$sheetCommitOrder"
 } else {
   Write-Output "FALHOU_INICIAR. Veja log: $log"
 }

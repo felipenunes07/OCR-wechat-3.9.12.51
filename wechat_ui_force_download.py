@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from pywinauto import Desktop
-from pywinauto.application import Application
 from pywinauto.keyboard import send_keys
 
 
 MAIN_WINDOW_CLASS = "WeChatMainWndForPC"
 MAIN_WINDOW_RETRY_ATTEMPTS = 3
 MAIN_WINDOW_RETRY_DELAY_SECONDS = 1.5
+DEFAULT_WINDOW_BACKENDS = ("win32", "uia")
+DEFAULT_MAIN_WINDOW_CLASSES = (MAIN_WINDOW_CLASS, "Base_PowerMessageWindow", "Chrome_WidgetWin_0")
 CLASSIC_VIEWER_CLASSES = {"WeChatAppEx", "Chrome_WidgetWin_0"}
 HOVER_WINDOW_CLASSES = {"HttpImgHoverWnd", "Search2Wnd"}
 CONVERSATION_PARENT_MARKERS = {"会话", "conversation"}
@@ -101,11 +102,59 @@ def build_search_candidates(display_name: str) -> list[str]:
     return out or [raw]
 
 
+def parse_token_list(raw: Any, default: tuple[str, ...]) -> list[str]:
+    if raw is None:
+        values = list(default)
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(item or "").strip() for item in raw]
+    else:
+        values = re.split(r"[\s,;|]+", str(raw or "").strip())
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        token = str(value or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        out.append(token)
+        seen.add(key)
+    return out or list(default)
+
+
 class WeChatUIForceDownloader:
-    def __init__(self, focus_policy: str = "immediate", item_timeout_seconds: int = 5) -> None:
+    def __init__(
+        self,
+        focus_policy: str = "immediate",
+        item_timeout_seconds: int = 5,
+        window_backends: Any = None,
+        window_class_candidates: Any = None,
+    ) -> None:
         self.focus_policy = str(focus_policy or "immediate").strip().lower() or "immediate"
         self.item_timeout_seconds = max(1, int(item_timeout_seconds))
-        self.desktop = Desktop(backend="uia")
+        self.window_backends = [token.lower() for token in parse_token_list(window_backends, DEFAULT_WINDOW_BACKENDS)]
+        self.window_class_candidates = parse_token_list(window_class_candidates, DEFAULT_MAIN_WINDOW_CLASSES)
+        self.uia_desktop = Desktop(backend="uia")
+        self.win32_desktop = Desktop(backend="win32")
+        self.desktop = self.uia_desktop
+
+    def _desktop_for_backend(self, backend: str) -> Any:
+        backend_key = str(backend or "").strip().lower()
+        if backend_key == "win32":
+            return self.win32_desktop
+        return self.uia_desktop
+
+    def _wrap_window_handle(self, handle: int, backend_preference: Optional[list[str]] = None) -> Optional[Any]:
+        for backend in backend_preference or self.window_backends:
+            try:
+                wrapper = self._desktop_for_backend(backend).window(handle=int(handle))
+                _ = wrapper.class_name()
+                return wrapper
+            except Exception:
+                continue
+        return None
 
     def _safe_window_text(self, wrapper: Any) -> str:
         try:
@@ -189,56 +238,70 @@ class WeChatUIForceDownloader:
         except Exception:
             pass
 
+    def _candidate_windows(self) -> list[tuple[str, str, Any]]:
+        out: list[tuple[str, str, Any]] = []
+        for class_name in self.window_class_candidates:
+            for backend in self.window_backends:
+                desktop = self._desktop_for_backend(backend)
+                try:
+                    windows = desktop.windows(class_name=class_name, visible_only=False)
+                except Exception:
+                    continue
+                for window in windows:
+                    out.append((backend, class_name, window))
+        return out
+
     def _probe_main_window_once(self) -> MainWindowProbeResult:
-        windows = []
-        lookup_note: Optional[str] = None
-        try:
-            windows = self.desktop.windows(class_name=MAIN_WINDOW_CLASS, visible_only=False)
-        except Exception as exc:
-            windows = []
-            lookup_note = f"class_lookup_err={type(exc).__name__}:{self._compact_text(exc, limit=72)}"
-        ordered = sorted(windows, key=self._window_area, reverse=True)
-        visible = [win for win in ordered if self._is_visible(win)]
-        sample = self._summarize_candidates(ordered)
-        if visible:
+        candidates = self._candidate_windows()
+        windows = [window for _backend, _class_name, window in candidates]
+        sample = self._summarize_candidates(windows)
+        if not candidates:
+            return MainWindowProbeResult(window=None, ready=False, note=f"class_count=0|sample={sample}")
+
+        def sort_key(item: tuple[str, str, Any]) -> tuple[int, int, int, int]:
+            backend, class_name, wrapper = item
+            try:
+                backend_rank = self.window_backends.index(str(backend).lower())
+            except ValueError:
+                backend_rank = len(self.window_backends)
+            try:
+                class_rank = [value.lower() for value in self.window_class_candidates].index(str(class_name).lower())
+            except ValueError:
+                class_rank = len(self.window_class_candidates)
+            visible_rank = 0 if self._is_visible(wrapper) else 1
+            return (backend_rank, class_rank, visible_rank, -self._window_area(wrapper))
+
+        ordered = sorted(candidates, key=sort_key)
+        for backend, class_name, raw_window in ordered:
+            try:
+                handle = int(raw_window.handle)
+            except Exception:
+                continue
+            activation_window = self._wrap_window_handle(handle, backend_preference=["win32", backend])
+            wrapped_window = self._wrap_window_handle(handle, backend_preference=["uia", backend, "win32"])
+            if activation_window is None and wrapped_window is None:
+                continue
+
+            restore_target = activation_window or wrapped_window
+            restored = False
+            if restore_target is not None:
+                rect = self._safe_rectangle(restore_target)
+                should_restore = not self._is_visible(restore_target) or rect is None
+                if should_restore:
+                    restored = self._restore_window(restore_target)
+
+            ready = self._is_visible(restore_target or wrapped_window)
+            chosen = wrapped_window or activation_window
             return MainWindowProbeResult(
-                window=visible[0],
-                ready=True,
-                note=f"source=class_visible|class_count={len(windows)}|sample={sample}",
-            )
-        if ordered:
-            restored = self._restore_window(ordered[0])
-            return MainWindowProbeResult(
-                window=ordered[0],
-                ready=restored or self._is_visible(ordered[0]),
+                window=chosen,
+                ready=ready,
                 note=(
-                    f"source=class_hidden|class_count={len(windows)}|restore={'ok' if restored else 'no'}"
-                    f"|sample={sample}"
+                    f"source=class_handle|backend={backend}|class={class_name}|handle={handle}"
+                    f"|restore={'ok' if restored else 'no'}|sample={sample}"
                 ),
             )
-        try:
-            app = Application(backend="uia").connect(path="WeChat.exe")
-            win = app.top_window()
-            if win is None:
-                note_parts = [f"class_count={len(windows)}", f"sample={sample}", "fallback=top_window_none"]
-                if lookup_note:
-                    note_parts.insert(0, lookup_note)
-                return MainWindowProbeResult(window=None, ready=False, note="|".join(note_parts))
-            restored = self._restore_window(win)
-            return MainWindowProbeResult(
-                window=win,
-                ready=restored or self._is_visible(win),
-                note=(
-                    f"source=process_connect|class_count={len(windows)}|restore={'ok' if restored else 'no'}"
-                    f"|fallback={self._describe_wrapper(win)}"
-                ),
-            )
-        except Exception as exc:
-            note_parts = [f"class_count={len(windows)}", f"sample={sample}"]
-            if lookup_note:
-                note_parts.insert(0, lookup_note)
-            note_parts.append(f"fallback_err={type(exc).__name__}:{self._compact_text(exc, limit=72)}")
-            return MainWindowProbeResult(window=None, ready=False, note="|".join(note_parts))
+
+        return MainWindowProbeResult(window=None, ready=False, note=f"class_handle_unusable|sample={sample}")
 
     def _probe_main_window(
         self,
@@ -273,11 +336,20 @@ class WeChatUIForceDownloader:
         raise RuntimeError(f"wechat_main_window_not_found|{result.note}")
 
     def _focus_main_window(self, win: Any) -> None:
+        handle: Optional[int]
         try:
-            if self.focus_policy == "immediate":
-                win.restore()
+            handle = int(win.handle)
+        except Exception:
+            handle = None
+        activation = self._wrap_window_handle(handle, backend_preference=["win32"]) if handle is not None else None
+        try:
+            if self.focus_policy == "immediate" and activation is not None:
+                activation.restore()
         except Exception:
             pass
+        if activation is not None:
+            self._focus_wrapper(activation)
+            time.sleep(0.15)
         self._focus_wrapper(win)
         time.sleep(0.25)
 
@@ -326,7 +398,7 @@ class WeChatUIForceDownloader:
         out: list[Any] = []
         for class_name in HOVER_WINDOW_CLASSES:
             try:
-                windows = self.desktop.windows(class_name=class_name)
+                windows = self.win32_desktop.windows(class_name=class_name, visible_only=False)
             except Exception:
                 windows = []
             for win in windows:
@@ -471,7 +543,7 @@ class WeChatUIForceDownloader:
 
     def _classic_viewer_window(self, main_handle: int) -> Optional[Any]:
         try:
-            windows = self.desktop.windows()
+            windows = self.win32_desktop.windows(visible_only=False)
         except Exception:
             windows = []
         for win in windows:
@@ -566,11 +638,11 @@ class WeChatUIForceDownloader:
 
         menu_windows: list[Any] = []
         try:
-            menu_windows = self.desktop.windows(control_type="Menu")
+            menu_windows = self.uia_desktop.windows(control_type="Menu")
         except Exception:
             menu_windows = []
         try:
-            menu_windows.extend([win for win in self.desktop.windows(class_name="#32768") if self._is_visible(win)])
+            menu_windows.extend([win for win in self.win32_desktop.windows(class_name="#32768", visible_only=False) if self._is_visible(win)])
         except Exception:
             pass
 
