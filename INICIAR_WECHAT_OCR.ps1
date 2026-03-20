@@ -51,7 +51,7 @@ $originalWaitSeconds = 90
 $tempCorrelationSeconds = 30
 $resolutionMode = "db-first"
 $verificationColumnName = "STATUS_VERIFICACAO"
-$uiForceDownloadEnabled = $true
+$uiForceDownloadEnabled = $false
 $uiForceDelaySeconds = 15
 $uiForceScope = "mapped-groups"
 $uiFocusPolicy = "immediate"
@@ -65,6 +65,7 @@ $sheetMaterializationOrder = "desc"
 $sheetCommitOrder = "asc"
 $dbMergePath = Join-Path $dir ".runtime\\wechat_merge.db"
 $googleCredentialsPath = Join-Path $dir "google_service_account.json"
+$effectiveSinkMode = "excel"
 if (Test-Path $sinkConfigPath) {
   $sinkConfig = Get-Content $sinkConfigPath -Raw | ConvertFrom-Json
   if ($sinkConfig.sink_mode) { $sinkMode = [string]$sinkConfig.sink_mode }
@@ -104,7 +105,10 @@ if (-not [System.IO.Path]::IsPathRooted($dbMergePath)) {
 # Atualiza automaticamente o mapa hash->nome de grupo antes de iniciar.
 $mapUpdater = Join-Path $dir "refresh_group_map.py"
 if (Test-Path $mapUpdater) {
-  & $py -X utf8 $mapUpdater | Out-Null
+  & $py -X utf8 $mapUpdater
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "refresh_group_map.py falhou (exit=$LASTEXITCODE). Continuando inicializacao em modo resiliente."
+  }
 }
 
 if (Test-Path $pidf) {
@@ -148,11 +152,17 @@ $arguments = @(
 
 if ($sinkMode -eq "google-sheets") {
   if ([string]::IsNullOrWhiteSpace($gsheetRef)) {
-    throw "sink_config.json esta com Google Sheets ativo, mas sem spreadsheet_url/spreadsheet_id."
+    Write-Warning "Google Sheets configurado sem spreadsheet_url/spreadsheet_id. Fallback para Excel local."
+    $effectiveSinkMode = "excel"
+  } elseif (!(Test-Path $googleCredentialsPath)) {
+    Write-Warning "Credencial Google nao encontrada: $googleCredentialsPath. Fallback para Excel local."
+    $effectiveSinkMode = "excel"
+  } else {
+    $effectiveSinkMode = "google-sheets"
   }
-  if (!(Test-Path $googleCredentialsPath)) {
-    throw "Credencial Google nao encontrada: $googleCredentialsPath. Coloque o JSON da service account nesse caminho e compartilhe a planilha com o e-mail dela."
-  }
+}
+
+if ($effectiveSinkMode -eq "google-sheets") {
   $arguments += @("--sink-mode", "google-sheets", "--gsheet-ref", $gsheetRef, "--google-credentials-path", $googleCredentialsPath)
   if (-not [string]::IsNullOrWhiteSpace($gsheetWorksheet)) {
     $arguments += @("--gsheet-worksheet", $gsheetWorksheet)
@@ -171,10 +181,13 @@ Start-Sleep -Seconds 2
 if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) {
   Write-Output "INICIADO PID=$($p.Id)"
   Write-Output "LOG=$log"
-  if ($sinkMode -eq "google-sheets") {
+  if ($effectiveSinkMode -eq "google-sheets") {
     Write-Output "DESTINO=GOOGLE_SHEETS"
     Write-Output "PLANILHA=$gsheetRef"
   } else {
+    if ($sinkMode -eq "google-sheets") {
+      Write-Output "DESTINO_FALLBACK=EXCEL (credencial/config Google indisponivel neste PC)"
+    }
     Write-Output "EXCEL=$excel"
   }
   Write-Output "RESOLUTION_MODE=$resolutionMode"

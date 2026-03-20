@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 
 APP_TITLE = "Painel WeChat OCR"
@@ -20,6 +21,8 @@ MAX_QUEUE_ROWS = 80
 MAX_MESSAGE_ROWS = 120
 MAX_RECEIPT_ROWS = 40
 MAX_LOG_LINES = 24
+UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
+SINK_CONFIG_FILE = "sink_config.json"
 
 WAITING_LABELS = {
     "WAITING_ORIGINAL_MEDIA": "Aguardando original",
@@ -53,6 +56,7 @@ class DashboardSnapshot:
     last_exception: str
     last_resolution: str
     last_verification: str
+    ui_force_runtime_enabled: bool
     error: str = ""
 
 
@@ -170,10 +174,323 @@ def scalar_text(cur: sqlite3.Cursor, sql: str, params: tuple[Any, ...] = ()) -> 
     return str(row[0] or "").strip() if row else ""
 
 
+def parse_boolish(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def read_ui_force_config_default(base_dir: Path) -> bool:
+    cfg_path = base_dir / SINK_CONFIG_FILE
+    if not cfg_path.exists():
+        return False
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(raw, dict):
+        return False
+    return parse_boolish(raw.get("ui_force_download_enabled"), default=False)
+
+
+def read_ui_force_runtime_enabled(base_dir: Path) -> bool:
+    default_enabled = read_ui_force_config_default(base_dir)
+    db_path = base_dir / "wechat_receipt_state.db"
+    if not db_path.exists():
+        return default_enabled
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2.0)
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key=? LIMIT 1",
+            (UI_FORCE_RUNTIME_META_KEY,),
+        ).fetchone()
+    except Exception:
+        return default_enabled
+    finally:
+        if conn is not None:
+            conn.close()
+    if row is None:
+        return default_enabled
+    return parse_boolish(row[0], default=default_enabled)
+
+
+def set_ui_force_runtime_enabled(base_dir: Path, enabled: bool) -> tuple[bool, str]:
+    db_path = base_dir / "wechat_receipt_state.db"
+    if not db_path.exists():
+        return False, "Banco nao encontrado para aplicar o modo manual."
+
+    now = time.time()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=6.0)
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """
+            INSERT INTO meta(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (UI_FORCE_RUNTIME_META_KEY, "1" if enabled else "0", float(now)),
+        )
+
+        released_jobs = 0
+        requeued_files = 0
+        if not enabled:
+            has_message_jobs = bool(
+                cur.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_jobs'"
+                ).fetchone()[0]
+            )
+            if has_message_jobs:
+                released_jobs = int(
+                    cur.execute(
+                        """
+                        UPDATE message_jobs
+                        SET state='WAITING_ORIGINAL',
+                            batch_id=NULL,
+                            next_ui_attempt_at=0,
+                            last_seen_at=?,
+                            last_ui_result=CASE
+                                WHEN last_ui_result IS NULL OR last_ui_result=''
+                                THEN 'UI_FORCE_DISABLED_MANUAL_MODE'
+                                ELSE last_ui_result
+                            END
+                        WHERE state IN ('UI_FORCE_PENDING', 'UI_FORCE_RUNNING')
+                        """,
+                        (float(now),),
+                    ).rowcount
+                    or 0
+                )
+            requeued_files = int(
+                cur.execute(
+                    """
+                    UPDATE files
+                    SET status=CASE
+                            WHEN status='processing' THEN 'processing'
+                            ELSE 'retry'
+                        END,
+                        next_attempt=CASE
+                            WHEN next_attempt > ? THEN ?
+                            ELSE next_attempt
+                        END,
+                        last_error='WAITING_ORIGINAL_MEDIA'
+                    WHERE status IN ('pending', 'retry', 'processing')
+                      AND last_error='WAITING_UI_FORCE_DOWNLOAD'
+                    """,
+                    (float(now + 3), float(now + 3)),
+                ).rowcount
+                or 0
+            )
+        conn.commit()
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False, f"Falha ao atualizar modo UI: {type(exc).__name__}: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if enabled:
+        return True, "Auto clique no WeChat ativado."
+    return True, f"Modo manual ativo (auto clique OFF). Itens liberados: jobs={released_jobs}, fila={requeued_files}."
+
+
+def clear_queue_backlog(base_dir: Path) -> tuple[bool, str]:
+    db_path = base_dir / "wechat_receipt_state.db"
+    if not db_path.exists():
+        return False, "Banco nao encontrado para limpar a fila."
+
+    cutoff = time.time()
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=8.0)
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+
+        files_ignored = int(
+            cur.execute(
+                """
+                UPDATE files
+                SET status='ignored',
+                    processed_at=?,
+                    next_attempt=0,
+                    last_error='IGNORED_BY_USER_CLEAR_QUEUE'
+                WHERE status IN ('pending', 'retry', 'processing')
+                  AND COALESCE(last_seen, first_seen, mtime, ctime, 0) <= ?
+                """,
+                (float(cutoff), float(cutoff)),
+            ).rowcount
+            or 0
+        )
+
+        has_message_jobs = bool(
+            cur.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_jobs'"
+            ).fetchone()[0]
+        )
+        message_jobs_cleared = 0
+        if has_message_jobs:
+            message_jobs_cleared = int(
+                cur.execute(
+                    """
+                    UPDATE message_jobs
+                    SET state='EXCEPTION',
+                        batch_id=NULL,
+                        next_ui_attempt_at=0,
+                        last_seen_at=?,
+                        ui_force_completed_at=?,
+                        last_ui_result='IGNORED_BY_USER_CLEAR_QUEUE'
+                    WHERE state NOT IN ('RESOLVED', 'THUMB_FALLBACK', 'EXCEPTION')
+                      AND COALESCE(last_seen_at, first_seen_at, create_time, 0) <= ?
+                    """,
+                    (float(cutoff), float(cutoff), float(cutoff)),
+                ).rowcount
+                or 0
+            )
+
+        sink_cleared = int(
+            cur.execute(
+                """
+                UPDATE receipts
+                SET sheet_status='SINK_SKIPPED_BY_USER_CLEAR_QUEUE',
+                    sheet_next_attempt=0,
+                    sheet_last_error='IGNORED_BY_USER_CLEAR_QUEUE'
+                WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                  AND COALESCE(ingested_at, 0) <= ?
+                """,
+                (float(cutoff),),
+            ).rowcount
+            or 0
+        )
+
+        cur.execute(
+            """
+            INSERT INTO meta(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            ("last_manual_queue_clear_at", str(float(cutoff)), float(cutoff)),
+        )
+        conn.commit()
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False, f"Falha ao limpar fila: {type(exc).__name__}: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return (
+        True,
+        "Fila antiga descartada. "
+        f"Arquivos={files_ignored}, mensagens={message_jobs_cleared}, pendencias_sink={sink_cleared}.",
+    )
+
+
+def stop_daemon_processing(base_dir: Path) -> tuple[bool, str]:
+    pid_path = base_dir / "wechat_receipt.pid"
+    if not pid_path.exists():
+        return True, "Daemon ja estava parado."
+
+    try:
+        raw = pid_path.read_text(encoding="ascii", errors="ignore").strip().splitlines()[0]
+        pid = int(raw)
+    except Exception:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True, "PID invalido removido. Daemon considerado parado."
+
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"Falha ao executar taskkill: {type(exc).__name__}: {exc}"
+    output = f"{result.stdout}\n{result.stderr}".strip().lower()
+    not_found_tokens = (
+        "no running instance",
+        "not found",
+        "nao foi",
+        "cannot find",
+        "not valid",
+    )
+    stopped = result.returncode == 0 or any(token in output for token in not_found_tokens)
+    if stopped:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True, f"Processamento parado (PID {pid})."
+    return False, f"Falha ao parar daemon PID {pid}: {short_text(output, limit=180)}"
+
+
+def restart_daemon_processing(base_dir: Path) -> tuple[bool, str]:
+    stop_ok, stop_message = stop_daemon_processing(base_dir)
+    if not stop_ok:
+        return False, f"Nao foi possivel parar antes de reiniciar: {stop_message}"
+    start_script = base_dir / "INICIAR_WECHAT_OCR.ps1"
+    if not start_script.exists():
+        return False, f"Script de inicio nao encontrado: {start_script}"
+
+    time.sleep(1.0)
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(start_script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            cwd=str(base_dir),
+        )
+    except Exception as exc:
+        return False, f"Falha ao iniciar novamente: {type(exc).__name__}: {exc}"
+
+    daemon_status, daemon_running = process_status(base_dir / "wechat_receipt.pid")
+    stdout = short_text(result.stdout or "", limit=160)
+    stderr = short_text(result.stderr or "", limit=160)
+    details = " | ".join(part for part in [stdout, stderr] if part and part != "-")
+
+    if daemon_running:
+        status_msg = f"Processamento reiniciado. {daemon_status}."
+        if details:
+            return True, f"{status_msg} Saida: {details}"
+        return True, status_msg
+
+    if details:
+        return False, f"Falha ao reiniciar. {details}"
+    return False, f"Falha ao reiniciar. {stop_message}"
+
+
 def load_snapshot(base_dir: Path) -> DashboardSnapshot:
     db_path = base_dir / "wechat_receipt_state.db"
     log_path = base_dir / "wechat_receipt.out.log"
     pid_path = base_dir / "wechat_receipt.pid"
+    ui_force_runtime_enabled = read_ui_force_runtime_enabled(base_dir)
 
     daemon_status, daemon_running = process_status(pid_path)
     snapshot = DashboardSnapshot(
@@ -189,6 +506,7 @@ def load_snapshot(base_dir: Path) -> DashboardSnapshot:
         last_exception="-",
         last_resolution="-",
         last_verification="-",
+        ui_force_runtime_enabled=ui_force_runtime_enabled,
     )
 
     if not db_path.exists():
@@ -399,6 +717,7 @@ class DashboardApp(tk.Tk):
         self._job: Optional[str] = None
         self._queue_item_paths: dict[str, str] = {}
         self._message_item_paths: dict[str, str] = {}
+        self._ui_force_runtime_enabled = read_ui_force_runtime_enabled(base_dir)
 
         self.title(APP_TITLE)
         self.geometry("1320x860")
@@ -504,6 +823,53 @@ class DashboardApp(tk.Tk):
             bg="#1d4ed8",
             fg="#ffffff",
             activebackground="#2563eb",
+            relief="flat",
+            padx=12,
+            pady=5,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(8, 0))
+        self.ui_toggle_button = tk.Button(
+            actions,
+            text="Auto clique: -",
+            command=self.toggle_ui_force_runtime,
+            relief="flat",
+            padx=12,
+            pady=5,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.ui_toggle_button.pack(side="left", padx=(8, 0))
+        self._render_ui_toggle_button(self._ui_force_runtime_enabled)
+        tk.Button(
+            actions,
+            text="Limpar fila antiga",
+            command=self.clear_queue_now,
+            bg="#b45309",
+            fg="#ffffff",
+            activebackground="#c2410c",
+            relief="flat",
+            padx=12,
+            pady=5,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(8, 0))
+        tk.Button(
+            actions,
+            text="Parar processamento",
+            command=self.stop_processing_now,
+            bg="#991b1b",
+            fg="#ffffff",
+            activebackground="#b91c1c",
+            relief="flat",
+            padx=12,
+            pady=5,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(8, 0))
+        tk.Button(
+            actions,
+            text="Iniciar novamente",
+            command=self.restart_processing_now,
+            bg="#166534",
+            fg="#ffffff",
+            activebackground="#15803d",
             relief="flat",
             padx=12,
             pady=5,
@@ -644,6 +1010,94 @@ class DashboardApp(tk.Tk):
         )
         self.error_label.pack(anchor="w", pady=(6, 0))
 
+        self.action_label = tk.Label(
+            footer,
+            text="",
+            bg="#dfe7f1",
+            fg="#065f46",
+            justify="left",
+            anchor="w",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.action_label.pack(anchor="w", pady=(6, 0))
+
+    def _render_ui_toggle_button(self, enabled: bool) -> None:
+        self._ui_force_runtime_enabled = bool(enabled)
+        if self._ui_force_runtime_enabled:
+            self.ui_toggle_button.configure(
+                text="Auto clique: ON",
+                bg="#dc2626",
+                fg="#ffffff",
+                activebackground="#ef4444",
+            )
+        else:
+            self.ui_toggle_button.configure(
+                text="Auto clique: OFF (manual)",
+                bg="#166534",
+                fg="#ffffff",
+                activebackground="#15803d",
+            )
+
+    def toggle_ui_force_runtime(self) -> None:
+        target = not self._ui_force_runtime_enabled
+        ok, message = set_ui_force_runtime_enabled(self.base_dir, target)
+        if ok:
+            self.action_label.configure(text=message)
+            self.error_label.configure(text="")
+        else:
+            self.error_label.configure(text=message)
+        self.refresh_now()
+
+    def clear_queue_now(self) -> None:
+        confirm = messagebox.askyesno(
+            "Limpar fila antiga",
+            "Descartar tudo que esta na fila agora?\n"
+            "Depois disso, apenas novos itens (a partir de agora) serao processados.",
+            icon="warning",
+        )
+        if not confirm:
+            return
+        ok, message = clear_queue_backlog(self.base_dir)
+        if ok:
+            self.action_label.configure(text=message)
+            self.error_label.configure(text="")
+        else:
+            self.error_label.configure(text=message)
+        self.refresh_now()
+
+    def stop_processing_now(self) -> None:
+        confirm = messagebox.askyesno(
+            "Parar processamento",
+            "Parar o daemon agora?\n"
+            "Ele deixara de processar ate voce iniciar novamente.",
+            icon="warning",
+        )
+        if not confirm:
+            return
+        ok, message = stop_daemon_processing(self.base_dir)
+        if ok:
+            self.action_label.configure(text=message)
+            self.error_label.configure(text="")
+        else:
+            self.error_label.configure(text=message)
+        self.refresh_now()
+
+    def restart_processing_now(self) -> None:
+        confirm = messagebox.askyesno(
+            "Iniciar novamente",
+            "Parar e iniciar o daemon novamente agora?",
+            icon="warning",
+        )
+        if not confirm:
+            return
+        ok, message = restart_daemon_processing(self.base_dir)
+        if ok:
+            self.action_label.configure(text=message)
+            self.error_label.configure(text="")
+        else:
+            self.error_label.configure(text=message)
+        self.refresh_now()
+
     def _replace_tree_rows(
         self,
         tree: ttk.Treeview,
@@ -701,6 +1155,7 @@ class DashboardApp(tk.Tk):
 
         status_bg = "#166534" if snapshot.daemon_running else "#9f1239"
         self.status_label.configure(text=snapshot.daemon_status, bg=status_bg)
+        self._render_ui_toggle_button(snapshot.ui_force_runtime_enabled)
         for title, card in self.metric_cards.items():
             card.set_value(snapshot.metrics.get(title, "-"))
 
@@ -724,7 +1179,9 @@ class DashboardApp(tk.Tk):
         self._render_log(snapshot.log_lines)
 
         self.last_refresh_label.configure(text=f"Ultima atualizacao: {fmt_dt(time.time())}")
+        ui_mode = "ON" if snapshot.ui_force_runtime_enabled else "OFF (manual)"
         summary = (
+            f"Auto clique WeChat: {ui_mode} | "
             f"Ultimo UI: {short_text(snapshot.last_ui_result, 60)} | "
             f"Grupo UI: {short_text(snapshot.last_ui_talker, 40)} | "
             f"Ultima resolucao: {short_text(snapshot.last_resolution, 28)} | "

@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -78,6 +79,7 @@ BASE_LANC_HEADERS = [
     "VALOR",
 ]
 DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
+UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 
 
 def is_candidate(path: Path) -> bool:
@@ -764,6 +766,9 @@ class WeChatDBResolver:
             import pywxdump  # type: ignore
             from pywxdump.db.dbMSG import get_BytesExtra  # type: ignore
 
+            # pywxdump emits a warning for unsupported account/nickname offsets even when key/wx_dir are usable.
+            # Keep errors visible, but suppress warning noise that confuses operators.
+            logging.getLogger("wx_core").setLevel(logging.ERROR)
             self._pywxdump = pywxdump
             self._decode_bytes_extra = get_BytesExtra
         except Exception as exc:
@@ -775,7 +780,7 @@ class WeChatDBResolver:
         if self._pywxdump is None:
             return False
         try:
-            infos = self._pywxdump.get_wx_info()
+            infos = self._pywxdump.get_wx_info(is_print=False)
         except Exception as exc:
             self._last_error = f"wx_info_failed:{type(exc).__name__}:{exc}"
             return False
@@ -1252,6 +1257,86 @@ class StateDB:
             )
             self._conn.commit()
 
+    @staticmethod
+    def _parse_bool_text(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if not text:
+            return default
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def is_ui_force_runtime_enabled(self, default_enabled: bool = False) -> bool:
+        if not default_enabled:
+            return False
+        raw = self.get_meta(UI_FORCE_RUNTIME_META_KEY)
+        if raw is None:
+            return True
+        return self._parse_bool_text(raw, default=False)
+
+    def set_ui_force_runtime_enabled(self, enabled: bool, release_waiting: bool = True) -> tuple[int, int]:
+        now = time.time()
+        released_jobs = 0
+        requeued_files = 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO meta(key, value, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (UI_FORCE_RUNTIME_META_KEY, "1" if enabled else "0", float(now)),
+            )
+            if not enabled and release_waiting:
+                released_jobs = int(
+                    cur.execute(
+                        """
+                        UPDATE message_jobs
+                        SET state='WAITING_ORIGINAL',
+                            batch_id=NULL,
+                            next_ui_attempt_at=0,
+                            last_seen_at=?,
+                            last_ui_result=CASE
+                                WHEN last_ui_result IS NULL OR last_ui_result=''
+                                THEN 'UI_FORCE_DISABLED_MANUAL_MODE'
+                                ELSE last_ui_result
+                            END
+                        WHERE state IN ('UI_FORCE_PENDING', 'UI_FORCE_RUNNING')
+                        """,
+                        (float(now),),
+                    ).rowcount
+                    or 0
+                )
+                requeued_files = int(
+                    cur.execute(
+                        """
+                        UPDATE files
+                        SET status=CASE
+                                WHEN status='processing' THEN 'processing'
+                                ELSE 'retry'
+                            END,
+                            next_attempt=CASE
+                                WHEN next_attempt > ? THEN ?
+                                ELSE next_attempt
+                            END,
+                            last_error='WAITING_ORIGINAL_MEDIA'
+                        WHERE status IN ('pending', 'retry', 'processing')
+                          AND last_error='WAITING_UI_FORCE_DOWNLOAD'
+                        """,
+                        (float(now + 3), float(now + 3)),
+                    ).rowcount
+                    or 0
+                )
+            self._conn.commit()
+        return released_jobs, requeued_files
+
     def ignore_stale_queue(self, older_than_mtime: float) -> int:
         now = time.time()
         with self._lock:
@@ -1397,7 +1482,8 @@ class StateDB:
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN 0 ELSE 1 END ASC,
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.create_time END ASC,
                     CASE WHEN mj.create_time IS NOT NULL AND mj.create_time > 0 THEN mj.msg_svr_id END ASC,
-                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.mtime END DESC,
+                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.first_seen END ASC,
+                    CASE WHEN mj.create_time IS NULL OR mj.create_time <= 0 THEN f.mtime END ASC,
                     f.next_attempt ASC
                 LIMIT 1
                 """,
@@ -2708,7 +2794,25 @@ class UIForceDownloadWorker(threading.Thread):
         if not self.available or self._downloader is None:
             return
 
+        runtime_disabled = False
         while not self.stop_event.is_set():
+            runtime_enabled = self.db.is_ui_force_runtime_enabled(default_enabled=self.cfg.ui_force_download_enabled)
+            if not runtime_enabled:
+                if not runtime_disabled:
+                    moved_jobs, requeued_files = self.db.set_ui_force_runtime_enabled(False, release_waiting=True)
+                    self.db.set_meta("last_ui_result", "ui_force_disabled_runtime_manual_mode")
+                    print(
+                        f"[UI] runtime_disabled | moved_jobs={moved_jobs} | "
+                        f"requeued_files={requeued_files}"
+                    )
+                    runtime_disabled = True
+                self.stop_event.wait(max(0.7, self.cfg.idle_sleep_seconds))
+                continue
+            if runtime_disabled:
+                self.db.set_meta("last_ui_result", "ui_force_reenabled_runtime")
+                print("[UI] runtime_reenabled")
+                runtime_disabled = False
+
             try:
                 batch_id, jobs = self.db.claim_ui_batch(materialization_order=self.cfg.sheet_materialization_order)
             except Exception as exc:
@@ -2795,6 +2899,7 @@ def resolve_media_candidate(
     now = time.time()
     wait_deadline = item.first_seen + float(cfg.original_wait_seconds)
     ui_force_deadline = item.first_seen + float(cfg.ui_force_delay_seconds)
+    ui_force_runtime_enabled = db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)
 
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
@@ -2925,9 +3030,17 @@ def resolve_media_candidate(
 
         tracked_state = str(tracked_job["state"] or "") if tracked_job is not None else ""
         if tracked_job is not None and tracked_state == "UI_FORCE_RUNNING" and now < wait_deadline:
-            db.mark_hold(item.file_id, reason="WAITING_UI_FORCE_DOWNLOAD", delay_sec=10)
-            print(f"[HOLD] {original_path.name} | waiting_ui_force_download_running")
-            return None
+            if ui_force_runtime_enabled:
+                db.mark_hold(item.file_id, reason="WAITING_UI_FORCE_DOWNLOAD", delay_sec=10)
+                print(f"[HOLD] {original_path.name} | waiting_ui_force_download_running")
+                return None
+            db.set_message_job_state(
+                msg_ref.msg_svr_id if msg_ref is not None else None,
+                "WAITING_ORIGINAL",
+                note="WAITING_ORIGINAL_MEDIA",
+                next_ui_attempt_at=0.0,
+                reset_batch=True,
+            )
 
         if tracked_job is not None and now < ui_force_deadline:
             db.set_message_job_state(msg_ref.msg_svr_id if msg_ref is not None else None, "WAITING_ORIGINAL", note="WAITING_ORIGINAL_MEDIA", next_ui_attempt_at=0.0, reset_batch=True)
@@ -2935,7 +3048,7 @@ def resolve_media_candidate(
             print(f"[HOLD] {original_path.name} | waiting_original_media")
             return None
 
-        if tracked_job is not None and cfg.ui_force_download_enabled and now < wait_deadline:
+        if tracked_job is not None and ui_force_runtime_enabled and now < wait_deadline:
             remaining = max(5, min(15, int(wait_deadline - now)))
             db.set_message_job_state(msg_ref.msg_svr_id if msg_ref is not None else None, "UI_FORCE_PENDING", note="WAITING_UI_FORCE_DOWNLOAD", next_ui_attempt_at=0.0, reset_batch=True)
             db.mark_hold(item.file_id, reason="WAITING_UI_FORCE_DOWNLOAD", delay_sec=remaining)
@@ -2947,7 +3060,7 @@ def resolve_media_candidate(
             print(f"[HOLD] {original_path.name} | waiting_original_media")
             return None
 
-        if tracked_job is not None and cfg.ui_force_download_enabled and tracked_state != "UI_FORCE_RUNNING":
+        if tracked_job is not None and ui_force_runtime_enabled and tracked_state != "UI_FORCE_RUNNING":
             db.set_message_job_state(
                 msg_ref.msg_svr_id if msg_ref is not None else None,
                 "UI_FORCE_PENDING",
@@ -3304,7 +3417,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-retries", type=int, default=0, help="0 means infinite retries")
     p.add_argument("--original-wait-seconds", type=int, default=int(os.getenv("WECHAT_ORIGINAL_WAIT_SECONDS", "90")))
     p.add_argument("--temp-correlation-seconds", type=int, default=int(os.getenv("WECHAT_TEMP_CORRELATION_SECONDS", "30")))
-    p.add_argument("--ui-force-download-enabled", default=os.getenv("WECHAT_UI_FORCE_DOWNLOAD_ENABLED", "true"))
+    p.add_argument("--ui-force-download-enabled", default=os.getenv("WECHAT_UI_FORCE_DOWNLOAD_ENABLED", "false"))
     p.add_argument("--ui-force-delay-seconds", type=int, default=int(os.getenv("WECHAT_UI_FORCE_DELAY_SECONDS", "15")))
     p.add_argument("--ui-force-scope", default=os.getenv("WECHAT_UI_FORCE_SCOPE", "mapped-groups"))
     p.add_argument("--ui-focus-policy", default=os.getenv("WECHAT_UI_FOCUS_POLICY", "immediate"))
@@ -3344,7 +3457,7 @@ def build_config(args: argparse.Namespace) -> Config:
         max_retries=max(0, args.max_retries),
         original_wait_seconds=max(30, int(args.original_wait_seconds)),
         temp_correlation_seconds=max(5, int(args.temp_correlation_seconds)),
-        ui_force_download_enabled=parse_boolish(args.ui_force_download_enabled, default=True),
+        ui_force_download_enabled=parse_boolish(args.ui_force_download_enabled, default=False),
         ui_force_delay_seconds=max(5, int(args.ui_force_delay_seconds)),
         ui_force_scope=(str(args.ui_force_scope).strip().lower() or "mapped-groups"),
         ui_focus_policy=(str(args.ui_focus_policy).strip().lower() or "immediate"),
@@ -3451,6 +3564,11 @@ def main() -> int:
         media_resolver = WeChatDBResolver(cfg.watch_roots, cfg.db_merge_path, refresh_seconds=10)
 
     db = StateDB(cfg.db_path)
+    if cfg.ui_force_download_enabled:
+        if db.get_meta(UI_FORCE_RUNTIME_META_KEY) is None:
+            db.set_ui_force_runtime_enabled(True, release_waiting=False)
+    else:
+        db.set_ui_force_runtime_enabled(False, release_waiting=False)
     ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
     if ignored_old:
         print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
@@ -3475,6 +3593,7 @@ def main() -> int:
             print(f"WeChat DB resolver: enabled | wx_dir={media_resolver.selected_wx_dir} | merge={cfg.db_merge_path}")
         else:
             print(f"WeChat DB resolver: degraded_to_path_only | err={media_resolver.last_error or 'unknown'}")
+    print(f"UI force runtime enabled: {db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)}")
 
     requeued = db.requeue_mapped_missing_client(resolver, max_age_hours=3, limit=1200)
     if requeued:

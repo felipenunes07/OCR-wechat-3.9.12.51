@@ -9,7 +9,7 @@
   "db_merge_path": ".runtime\\wechat_merge.db",
   "verification_column_name": "STATUS_VERIFICACAO",
   "resolution_mode": "db-first",
-  "ui_force_download_enabled": true,
+  "ui_force_download_enabled": false,
   "ui_force_delay_seconds": 15,
   "ui_force_scope": "mapped-groups",
   "ui_focus_policy": "immediate",
