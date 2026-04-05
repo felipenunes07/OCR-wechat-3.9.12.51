@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
+
 from wechat_receipt_daemon import (
     IGNORED_SESSION_ROLLOVER_STATE,
     SESSION_PENDING_OPEN_STATE,
@@ -19,6 +21,7 @@ from wechat_receipt_daemon import (
     normalize_amount,
     normalize_client_label,
     parse_receipt_fields,
+    prepare_image_for_ocr,
     round_amount_for_output,
     runtime_media_resolver,
     seed_ready_manual_session_placeholders,
@@ -54,6 +57,22 @@ class CandidateInitialDelayTests(unittest.TestCase):
         self.assertEqual(candidate_initial_delay_seconds("temp_image", 1, thumb_candidates_enabled=False), 3)
         self.assertEqual(candidate_initial_delay_seconds("msgattach_image_dat", 1, thumb_candidates_enabled=False), 1)
         self.assertEqual(candidate_initial_delay_seconds("temp_image", 5, thumb_candidates_enabled=False), 5)
+
+
+class PrepareImageForOCRTests(unittest.TestCase):
+    def test_downscales_large_non_thumb_images_to_1600_max_side(self) -> None:
+        img = Image.new("RGB", (1242, 2208), "white")
+
+        prepared = prepare_image_for_ocr(img, "msgattach_image_dat")
+
+        self.assertEqual(prepared.size, (900, 1600))
+
+    def test_keeps_normal_non_thumb_images_at_original_size(self) -> None:
+        img = Image.new("RGB", (640, 1600), "white")
+
+        prepared = prepare_image_for_ocr(img, "msgattach_image_dat")
+
+        self.assertEqual(prepared.size, (640, 1600))
 
 
 class RuntimeMediaResolverTests(unittest.TestCase):

@@ -1090,6 +1090,10 @@ def prepare_image_for_ocr(img: Image.Image, source_kind: str) -> Image.Image:
     w, h = out.size
     is_thumb_like = source_kind == "msgattach_thumb_dat" or max(w, h) <= 420
     if not is_thumb_like:
+        max_side = max(w, h)
+        if max_side > 1600:
+            scale = 1600.0 / float(max_side)
+            out = out.resize((max(1, int(w * scale)), max(1, int(h * scale))), LANCZOS_FILTER)
         return out
 
     # Miniatures are tiny and blurry; upscale + contrast helps OCR.
