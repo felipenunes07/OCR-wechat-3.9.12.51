@@ -2035,14 +2035,22 @@ class StateDB:
                 cur.execute(
                     """
                     UPDATE files
-                    SET last_seen=?, mtime=?, size=?, next_attempt=MIN(next_attempt, ?)
+                    SET last_seen=?,
+                        next_attempt=CASE
+                            WHEN mtime != ? THEN MIN(next_attempt, ?)
+                            WHEN status = 'retry' THEN next_attempt
+                            ELSE MIN(next_attempt, ?)
+                        END,
+                        mtime=?, size=?
                     WHERE file_id=?
                     """,
                     (
                         float(now),
                         float(st.st_mtime),
-                        int(st.st_size),
                         float(next_attempt),
+                        float(next_attempt),
+                        float(st.st_mtime),
+                        int(st.st_size),
                         existing["file_id"],
                     ),
                 )
@@ -5031,11 +5039,6 @@ def process_item(
         img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
-        if db.receipt_sha_exists(digest):
-            db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
-            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
-            print(f"[SKIP] {path.name} | duplicate_sha")
-            return
         q_score = quality_score(img)
 
         prep_started_at = time.perf_counter()
