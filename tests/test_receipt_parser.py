@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -22,6 +23,7 @@ from wechat_receipt_daemon import (
     normalize_client_label,
     parse_receipt_fields,
     prepare_image_for_ocr,
+    reconcile_scan,
     round_amount_for_output,
     runtime_media_resolver,
     seed_ready_manual_session_placeholders,
@@ -512,6 +514,42 @@ class CandidateFilterTests(unittest.TestCase):
             self.assertTrue(is_candidate(thumb_path, thumb_candidates_enabled=True))
             self.assertTrue(is_candidate(image_path, thumb_candidates_enabled=False))
             self.assertTrue(is_candidate(temp_path, thumb_candidates_enabled=False))
+
+
+class ReconcileScanTests(unittest.TestCase):
+    def test_startup_guard_skips_existing_files_but_keeps_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            db = StateDB(root / "state.db")
+            candidate = root / "MsgAttach" / "gid" / "Image" / "2026-04" / "receipt.dat"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"fake-image")
+            os.utime(candidate, (1000.0, 1000.0))
+            cfg = type(
+                "Cfg",
+                (),
+                {
+                    "watch_roots": [root],
+                    "settle_seconds": 1,
+                    "recent_files_hours": 24,
+                    "thumb_candidates_enabled": False,
+                    "process_existing_files_on_startup": False,
+                    "startup_time": 2000.0,
+                },
+            )()
+            try:
+                with patch("wechat_receipt_daemon.time.time", return_value=2005.0):
+                    first_count = reconcile_scan(cfg, db)
+                self.assertEqual(first_count, 0)
+                self.assertEqual(db._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 0)
+
+                os.utime(candidate, (2010.0, 2010.0))
+                with patch("wechat_receipt_daemon.time.time", return_value=2020.0):
+                    second_count = reconcile_scan(cfg, db)
+                self.assertEqual(second_count, 1)
+                self.assertEqual(db._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 1)
+            finally:
+                db.close()
 
 
 class ManualSessionOrderTests(unittest.TestCase):
@@ -1119,6 +1157,39 @@ class StaleProcessingRecoveryTests(unittest.TestCase):
                 db.close()
 
 
+class StartupSinkBacklogTests(unittest.TestCase):
+    def test_startup_backlog_marks_old_pending_receipts_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="old-staged",
+                        ingested_at=1000.0,
+                        msg_svr_id="old-msg",
+                        msg_create_time=100.0,
+                        amount=668.04,
+                        amount_rounded=668.0,
+                    )
+                )
+
+                ignored = db.ignore_stale_sink_receipts(older_than_ingested_at=2000.0)
+
+                self.assertEqual(ignored, 1)
+                row = db._conn.execute(
+                    """
+                    SELECT sheet_status, sheet_next_attempt, sheet_last_error
+                    FROM receipts
+                    WHERE file_id='old-staged'
+                    """
+                ).fetchone()
+                self.assertEqual(row["sheet_status"], "SINK_SKIPPED_TERMINAL")
+                self.assertEqual(row["sheet_next_attempt"], 0)
+                self.assertEqual(row["sheet_last_error"], "IGNORED_STARTUP_BACKLOG")
+            finally:
+                db.close()
+
+
 class RecordingSink:
     def __init__(self) -> None:
         self.updated_rows: list[tuple[str, int, dict[str, object], bool]] = []
@@ -1155,7 +1226,7 @@ class GoogleSheetsSinkTargetSheetTests(unittest.TestCase):
 
 
 class ReceiptBackfillTests(unittest.TestCase):
-    def test_backfill_updates_committed_receipt_and_sheet_payload(self) -> None:
+    def test_backfill_updates_committed_receipt_payload_without_touching_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = StateDB(Path(tmp_dir) / "state.db")
             try:
@@ -1210,7 +1281,7 @@ class ReceiptBackfillTests(unittest.TestCase):
 
                 updated, sheet_updated, sheet_failed = backfill_missing_receipt_fields(db, sink, cfg, limit=10)
 
-                self.assertEqual((updated, sheet_updated, sheet_failed), (1, 1, 0))
+                self.assertEqual((updated, sheet_updated, sheet_failed), (1, 0, 0))
                 row = db._conn.execute(
                     """
                     SELECT txn_date, txn_time, txn_date_source, txn_time_source,
@@ -1231,14 +1302,7 @@ class ReceiptBackfillTests(unittest.TestCase):
                 self.assertEqual(row["amount_source"], "currency_compact_cent_fix")
                 self.assertEqual(row["review_needed"], 1)
 
-                self.assertEqual(len(sink.updated_rows), 1)
-                sheet_name, row_idx, row_payload, review_needed = sink.updated_rows[0]
-                self.assertEqual(sheet_name, "Lancamentos")
-                self.assertEqual(row_idx, 7)
-                self.assertEqual(row_payload["txn_date"], "20/03/2026")
-                self.assertEqual(row_payload["txn_time"], "11:35")
-                self.assertEqual(row_payload["amount"], 668.0)
-                self.assertTrue(review_needed)
+                self.assertEqual(sink.updated_rows, [])
             finally:
                 db.close()
 

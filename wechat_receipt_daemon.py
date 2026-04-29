@@ -3399,6 +3399,36 @@ class StateDB:
             )
             self._conn.commit()
 
+    def ignore_stale_sink_receipts(self, older_than_ingested_at: float) -> int:
+        with self._lock:
+            cur = self._conn.cursor()
+            count = int(
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM receipts
+                    WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                      AND ingested_at < ?
+                    """,
+                    (float(older_than_ingested_at),),
+                ).fetchone()[0]
+            )
+            if count <= 0:
+                return 0
+            cur.execute(
+                """
+                UPDATE receipts
+                SET sheet_status='SINK_SKIPPED_TERMINAL',
+                    sheet_next_attempt=0,
+                    sheet_last_error='IGNORED_STARTUP_BACKLOG'
+                WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                  AND ingested_at < ?
+                """,
+                (float(older_than_ingested_at),),
+            )
+            self._conn.commit()
+            return count
+
     def ensure_message_job(
         self,
         msg_svr_id: Optional[str],
@@ -4298,6 +4328,8 @@ class Config:
     sheet_order_scope: str
     sheet_materialization_order: str
     sheet_commit_order: str
+    process_existing_files_on_startup: bool
+    startup_time: float
     disable_watchdog: bool
 
 
@@ -4307,7 +4339,11 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
     overlap_sec = max(60.0, float(cfg.settle_seconds * 3))
     fallback_floor = now - max(1, cfg.recent_files_hours) * 3600
     previous_watermark = db.get_meta_float("reconcile_watermark")
-    scan_floor = max(0.0, fallback_floor if previous_watermark is None else previous_watermark - overlap_sec)
+    startup_floor = 0.0 if cfg.process_existing_files_on_startup else float(cfg.startup_time or 0.0)
+    if previous_watermark is None:
+        scan_floor = max(0.0, fallback_floor, startup_floor)
+    else:
+        scan_floor = max(0.0, fallback_floor, previous_watermark - overlap_sec, startup_floor)
     newest_mtime = previous_watermark or 0.0
     for root in cfg.watch_roots:
         if not root.exists():
@@ -5317,22 +5353,9 @@ def backfill_missing_receipt_fields(db: StateDB, sink: RowSink, cfg: Config, lim
         )
         updated += 1
 
-        row_idx = row["excel_row"]
-        if str(row["sheet_status"] or "").strip() == "SINK_COMMITTED" and row_idx is not None:
-            try:
-                sink.update_row(
-                    sheet_name=str(row["excel_sheet"] or "").strip(),
-                    row_idx=int(row_idx),
-                    row_payload=sheet_payload,
-                    review_needed=review_needed,
-                )
-                sheet_updated += 1
-            except Exception as exc:
-                sheet_failed += 1
-                print(
-                    f"[WARN] backfill_sheet_update_failed | file_id={row['file_id']} "
-                    f"| sheet={row['excel_sheet']} | row={row_idx} | err={type(exc).__name__}: {exc}"
-                )
+        # Never rewrite already committed spreadsheet rows during startup
+        # recovery. Historical parser backfills are kept in the local state DB
+        # only; Sheets receives append-only writes from new receipt commits.
 
     return (updated, sheet_updated, sheet_failed)
 
@@ -5467,6 +5490,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sheet-order-scope", default=os.getenv("WECHAT_SHEET_ORDER_SCOPE", "per_talker"))
     p.add_argument("--sheet-materialization-order", default=os.getenv("WECHAT_SHEET_MATERIALIZATION_ORDER", "desc"))
     p.add_argument("--sheet-commit-order", default=os.getenv("WECHAT_SHEET_COMMIT_ORDER", "asc"))
+    p.add_argument("--process-existing-files-on-startup", default=os.getenv("WECHAT_PROCESS_EXISTING_FILES_ON_STARTUP", "false"))
     p.add_argument("--disable-watchdog", action="store_true")
     return p.parse_args()
 
@@ -5514,6 +5538,8 @@ def build_config(args: argparse.Namespace) -> Config:
         sheet_order_scope=(str(args.sheet_order_scope).strip().lower() or "per_talker"),
         sheet_materialization_order=(str(args.sheet_materialization_order).strip().lower() or "desc"),
         sheet_commit_order=(str(args.sheet_commit_order).strip().lower() or "asc"),
+        process_existing_files_on_startup=parse_boolish(args.process_existing_files_on_startup, default=False),
+        startup_time=float(time.time()),
         disable_watchdog=bool(args.disable_watchdog),
     )
 
@@ -5584,6 +5610,7 @@ def main() -> int:
     print(f"Sheet order scope: {cfg.sheet_order_scope}")
     print(f"Sheet materialization order: {cfg.sheet_materialization_order}")
     print(f"Sheet commit order: {cfg.sheet_commit_order}")
+    print(f"Process existing files on startup: {cfg.process_existing_files_on_startup}")
     if cfg.ui_force_download_enabled:
         if not UI_FORCE_DOWNLOADER_AVAILABLE or WeChatUIForceDownloader is None:
             err = UI_FORCE_DOWNLOADER_IMPORT_ERROR or "ui_downloader_unavailable"
@@ -5630,9 +5657,17 @@ def main() -> int:
                 f"[RECOVER] stale_manual_sessions_placeholders={stale_placeholders} "
                 f"| released_files={stale_released}"
             )
-    ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
-    if ignored_old:
-        print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
+    if cfg.process_existing_files_on_startup:
+        ignored_old = db.ignore_stale_queue(time.time() - max(1, cfg.recent_files_hours) * 3600)
+        if ignored_old:
+            print(f"[RECOVER] ignored_old_queue={ignored_old} | older_than_hours={cfg.recent_files_hours}")
+    else:
+        ignored_startup_backlog = db.ignore_stale_queue(cfg.startup_time)
+        if ignored_startup_backlog:
+            print(f"[RECOVER] ignored_startup_backlog={ignored_startup_backlog}")
+        ignored_startup_sink_rows = db.ignore_stale_sink_receipts(cfg.startup_time)
+        if ignored_startup_sink_rows:
+            print(f"[RECOVER] ignored_startup_sink_rows={ignored_startup_sink_rows}")
     cleaned_temp_orphans = db.cleanup_stale_temp_orphans(max_age_sec=max(600, cfg.original_wait_seconds * 4))
     if cleaned_temp_orphans:
         print(f"[RECOVER] stale_temp_orphans={cleaned_temp_orphans}")

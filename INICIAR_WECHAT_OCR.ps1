@@ -67,6 +67,7 @@ $uiWindowClasses = "WeChatMainWndForPC,Base_PowerMessageWindow,Chrome_WidgetWin_
 $sheetOrderScope = "per_talker"
 $sheetMaterializationOrder = "desc"
 $sheetCommitOrder = "asc"
+$processExistingFilesOnStartup = $false
 $dbMergePath = Join-Path $dir ".runtime\\wechat_merge.db"
 $googleCredentialsPath = Join-Path $dir "google_service_account.json"
 $effectiveSinkMode = "excel"
@@ -98,6 +99,7 @@ if (Test-Path $sinkConfigPath) {
   if ($sinkConfig.sheet_order_scope) { $sheetOrderScope = [string]$sinkConfig.sheet_order_scope }
   if ($sinkConfig.sheet_materialization_order) { $sheetMaterializationOrder = [string]$sinkConfig.sheet_materialization_order }
   if ($sinkConfig.sheet_commit_order) { $sheetCommitOrder = [string]$sinkConfig.sheet_commit_order }
+  if ($null -ne $sinkConfig.process_existing_files_on_startup) { $processExistingFilesOnStartup = [bool]$sinkConfig.process_existing_files_on_startup }
   if ($sinkConfig.db_merge_path) { $dbMergePath = [string]$sinkConfig.db_merge_path }
   if ($sinkConfig.google_credentials_path) {
     $googleCredentialsPath = [string]$sinkConfig.google_credentials_path
@@ -159,6 +161,7 @@ $arguments = @(
   "--sheet-order-scope", $sheetOrderScope,
   "--sheet-materialization-order", $sheetMaterializationOrder,
   "--sheet-commit-order", $sheetCommitOrder,
+  "--process-existing-files-on-startup", ($(if ($processExistingFilesOnStartup) { "true" } else { "false" })),
   "--client-map-path", (Join-Path $dir "clientes_grupos.json")
 )
 
@@ -236,6 +239,7 @@ if ($p) {
   Write-Output "SHEET_ORDER_SCOPE=$sheetOrderScope"
   Write-Output "SHEET_MATERIALIZATION_ORDER=$sheetMaterializationOrder"
   Write-Output "SHEET_COMMIT_ORDER=$sheetCommitOrder"
+  Write-Output "PROCESS_EXISTING_FILES_ON_STARTUP=$processExistingFilesOnStartup"
 } else {
   Write-Output "FALHOU_INICIAR. Veja log: $log"
   exit 1

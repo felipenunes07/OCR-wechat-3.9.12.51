@@ -19,5 +19,6 @@
   "ui_focus_policy": "immediate",
   "ui_batch_mode": "group-sequential",
   "ui_item_timeout_seconds": 5,
-  "ui_retry_backoff_seconds": [5, 10, 20, 40]
+  "ui_retry_backoff_seconds": [5, 10, 20, 40],
+  "process_existing_files_on_startup": false
 }

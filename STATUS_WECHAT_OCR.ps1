@@ -71,6 +71,8 @@ if (Test-Path $sinkConfigPath) {
     if ([string]::IsNullOrWhiteSpace($sheetMaterializationOrder)) { $sheetMaterializationOrder = "desc" }
     $sheetCommitOrder = [string]($sinkConfig.sheet_commit_order)
     if ([string]::IsNullOrWhiteSpace($sheetCommitOrder)) { $sheetCommitOrder = "asc" }
+    $processExistingFilesOnStartup = $false
+    if ($null -ne $sinkConfig.process_existing_files_on_startup) { $processExistingFilesOnStartup = [bool]$sinkConfig.process_existing_files_on_startup }
     Write-Output "GOOGLE_SHEETS_REF=$gsheetRef"
     Write-Output "GOOGLE_CREDENTIALS=$googleCredentialsPath"
     Write-Output "GOOGLE_CREDENTIALS_OK=$(Test-Path $googleCredentialsPath)"
@@ -92,6 +94,7 @@ if (Test-Path $sinkConfigPath) {
     Write-Output "SHEET_ORDER_SCOPE=$sheetOrderScope"
     Write-Output "SHEET_MATERIALIZATION_ORDER=$sheetMaterializationOrder"
     Write-Output "SHEET_COMMIT_ORDER=$sheetCommitOrder"
+    Write-Output "PROCESS_EXISTING_FILES_ON_STARTUP=$processExistingFilesOnStartup"
   } else {
     Write-Output "EXCEL=$excel"
   }
