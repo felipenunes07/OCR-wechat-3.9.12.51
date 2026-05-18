@@ -5067,9 +5067,18 @@ def process_item(
         client = resolver.resolve(resolution.client_source_path)
         if not client:
             gid = extract_group_id_from_path(resolution.client_source_path) or "SEM_GRUPO"
-            db.mark_hold(item.file_id, reason=f"MISSING_CLIENT_MAP:{gid}", delay_sec=120)
-            print(f"[HOLD] {path.name} | grupo_sem_mapa={gid}")
-            return
+            is_file_transfer = (
+                (resolution.msg_ref is not None and resolution.msg_ref.talker == "filehelper")
+                or gid == "9e20f478899dc29eb19741386f9343c8"
+            )
+            is_manual_open = (item.source_kind == "temp_image" or bool(item.manual_session_id))
+            if is_file_transfer or is_manual_open:
+                client = "-"
+                print(f"[INFO] {path.name} | grupo_sem_mapa={gid} mas prosseguindo (abertura manual/file_transfer)")
+            else:
+                db.mark_hold(item.file_id, reason=f"MISSING_CLIENT_MAP:{gid}", delay_sec=120)
+                print(f"[HOLD] {path.name} | grupo_sem_mapa={gid}")
+                return
 
         open_started_at = time.perf_counter()
         img, img_bytes, _ext, _key = open_image_from_file(path)
