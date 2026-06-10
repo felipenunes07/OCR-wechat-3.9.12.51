@@ -286,6 +286,8 @@ def process_status(pid_file: Path) -> tuple[str, bool]:
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             check=False,
         )
@@ -813,6 +815,8 @@ def stop_daemon_processing(base_dir: Path) -> tuple[bool, str]:
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -850,6 +854,8 @@ def restart_daemon_processing(base_dir: Path) -> tuple[bool, str]:
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(start_script)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
             check=False,
             cwd=str(base_dir),
