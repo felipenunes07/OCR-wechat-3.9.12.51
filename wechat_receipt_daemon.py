@@ -607,6 +607,9 @@ def normalize_client_label(value: Optional[str]) -> tuple[Optional[str], Optiona
     if not label:
         return (None, None)
 
+    if label.lower().startswith("ignore"):
+        return (None, "IGNORED_BY_USER")
+
     normalized = unicodedata.normalize("NFKC", label).upper().replace("—", "-")
     normalized_without_year = re.sub(r"\b2026\b", " ", normalized)
     match = re.search(r"\d+(?:-\d+)*(?:[A-Z](?![A-Z]))?", normalized_without_year)
