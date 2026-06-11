@@ -407,6 +407,7 @@ DATE_PATTERNS = [
     re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})"),
     re.compile(r"(?<!\d)(\d{1,2}-\d{1,2}-\d{4})"),
     re.compile(r"(?<!\d)(\d{1,2}/\d{1,2}/\d{2})(?!\d)"),
+    re.compile(r"(?<!\d)(\d{4}/\d{4})"),
 ]
 ALPHA_MONTH_DATE_PATTERN = re.compile(
     r"(?<!\d)(\d{1,2})(?:\s*de\s*|\s*[,\/\-.]?\s*)([a-z]{3,12})\.?(?:\s*de\s*|\s*[,\/\-.]?\s*)(\d{4})(?!\d)",
@@ -695,6 +696,19 @@ def normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     v = value.strip()
+
+    # Handle OCR typo where the first slash in DD/MM/YYYY was read as a digit (e.g. 1006/2026 instead of 10/06/2026)
+    m_typo = re.fullmatch(r"(\d{2})(\d{2})/(\d{4})", v)
+    if m_typo:
+        day = int(m_typo.group(1))
+        month = int(m_typo.group(2))
+        year = int(m_typo.group(3))
+        try:
+            dt = datetime(year, month, day)
+            return dt.strftime("%d/%m/%Y")
+        except Exception:
+            pass
+
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
         try:
             dt = datetime.strptime(v, fmt)
@@ -880,9 +894,21 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
             "pix",
             "transferência",
             "transferencia",
+            "transferincia",
+            "transfenincia",
+            "transferr",
             "pagamento",
             "recibo",
             "receipt",
+            "confirmação",
+            "confirmacao",
+            "confirmacio",
+            "operação",
+            "operacao",
+            "operaglo",
+            "operacho",
+            "ted",
+            "doc",
             "收款",
             "转账",
             "付款",
@@ -5184,6 +5210,46 @@ def process_item(
         ocr_ms = perf_duration_ms(ocr_started_at)
         ocr_chars = len(text)
         is_receipt, receipt_reason = looks_like_single_receipt(text)
+
+        # Raw image fallback logic if text is not a receipt or amount (valor) is missing
+        has_amount = False
+        if is_receipt:
+            temp_fields = parse_receipt_fields(text, ocr_conf=ocr_conf, q_score=q_score)
+            has_amount = temp_fields.get("amount") is not None
+
+        is_preprocessed = (
+            img_for_ocr.size != img.size or 
+            img_for_ocr.mode != img.mode or 
+            resolution.resolved_source_kind == "msgattach_thumb_dat"
+        )
+
+        if is_preprocessed and (not is_receipt or not has_amount):
+            print(f"[OCR] Attempting raw image fallback for {path.name} (is_receipt={is_receipt}, has_amount={has_amount})")
+            raw_ocr_started_at = time.perf_counter()
+            raw_img = img.convert("RGB")
+            raw_text, raw_ocr_conf = ocr.extract(raw_img)
+            raw_ocr_ms = perf_duration_ms(raw_ocr_started_at)
+
+            raw_is_receipt, raw_receipt_reason = looks_like_single_receipt(raw_text)
+            if raw_is_receipt:
+                raw_fields = parse_receipt_fields(raw_text, ocr_conf=raw_ocr_conf, q_score=q_score)
+                raw_has_amount = raw_fields.get("amount") is not None
+
+                accept_raw = False
+                if not is_receipt:
+                    accept_raw = True
+                elif not has_amount and raw_has_amount:
+                    accept_raw = True
+
+                if accept_raw:
+                    print(f"[OCR] Raw image fallback accepted for {path.name} (has_amount={raw_has_amount}, ms={raw_ocr_ms})")
+                    text = raw_text
+                    ocr_conf = raw_ocr_conf
+                    ocr_ms += raw_ocr_ms
+                    ocr_chars = len(text)
+                    is_receipt = raw_is_receipt
+                    receipt_reason = raw_receipt_reason
+
         if not is_receipt:
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
             db.mark_message_job_resolved(msg_svr_id, note=f"NOT_RECEIPT:{receipt_reason}")
