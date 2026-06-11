@@ -1371,8 +1371,8 @@ class WeChatDBResolver:
         self.wechat_root = self.wx_dirs[0].parent if self.wx_dirs else None
         self.merge_path = merge_path.resolve()
         self.refresh_seconds = max(5, int(refresh_seconds))
-        self.merge_timeout_seconds = 12
-        self.failure_backoff_seconds = max(30, self.refresh_seconds, self.merge_timeout_seconds * 2)
+        self.merge_timeout_seconds = 20
+        self.failure_backoff_seconds = 120
         self._pywxdump: Any = None
         self._decode_bytes_extra: Any = None
         self._wx_key: Optional[str] = None
@@ -1381,6 +1381,8 @@ class WeChatDBResolver:
         self._last_failure = 0.0
         self._last_error: Optional[str] = None
         self._lock = threading.Lock()
+        self._merge_thread: Optional[threading.Thread] = None
+        self._merge_thread_lock = threading.Lock()
         self._load_dependencies()
         self._load_account_info(force=True)
 
@@ -1486,6 +1488,9 @@ class WeChatDBResolver:
                 pass
 
     def _merge_real_time_db_with_timeout(self) -> tuple[bool, str]:
+        return self._merge_real_time_db_with_timeout_path(self.merge_path)
+
+    def _merge_real_time_db_with_timeout_path(self, target_path: Path) -> tuple[bool, str]:
         assert self._wx_key is not None
         assert self._wx_dir is not None
 
@@ -1506,7 +1511,7 @@ class WeChatDBResolver:
                     runner,
                     self._wx_key,
                     str(self._wx_dir),
-                    str(self.merge_path),
+                    str(target_path),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1549,28 +1554,67 @@ class WeChatDBResolver:
         self._last_error = detail
         return False
 
+    def _run_background_merge(self, started_at: float, force: bool) -> None:
+        try:
+            self.merge_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_merge_path = self.merge_path.with_suffix(".db.tmp")
+            if tmp_merge_path.exists():
+                try:
+                    tmp_merge_path.unlink()
+                except Exception:
+                    pass
+
+            code, ret = self._merge_real_time_db_with_timeout_path(tmp_merge_path)
+
+            with self._lock:
+                if code:
+                    try:
+                        if self.merge_path.exists():
+                            self.merge_path.unlink()
+                        tmp_merge_path.rename(self.merge_path)
+                        self._last_refresh = time.time()
+                        self._last_failure = 0.0
+                        self._last_error = None
+                    except Exception as exc:
+                        self._mark_refresh_failure(time.time(), f"rename_failed:{type(exc).__name__}:{exc}")
+                else:
+                    self._mark_refresh_failure(time.time(), f"merge_failed:{ret}")
+                    try:
+                        if tmp_merge_path.exists():
+                            tmp_merge_path.unlink()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            with self._lock:
+                self._mark_refresh_failure(time.time(), f"bg_merge_exception:{type(exc).__name__}:{exc}")
+
     def refresh_if_due(self, force: bool = False) -> bool:
+        if self._pywxdump is None:
+            return False
+
         with self._lock:
             now = time.time()
             if not force and self.merge_path.exists() and (now - self._last_refresh) < self.refresh_seconds:
                 return True
             if not force and self._last_failure > 0 and (now - self._last_failure) < self.failure_backoff_seconds:
-                return False
-            if not self._load_account_info(force=force):
-                self._last_failure = now
-                return False
-            self.merge_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                assert self._pywxdump is not None
-                code, ret = self._merge_real_time_db_with_timeout()
-            except Exception as exc:
-                return self._mark_refresh_failure(now, f"merge_failed:{type(exc).__name__}:{exc}")
-            if not code:
-                return self._mark_refresh_failure(now, f"merge_failed:{ret}")
-            self._last_refresh = now
-            self._last_failure = 0.0
-            self._last_error = None
-            return True
+                return self.merge_path.exists()
+
+            with self._merge_thread_lock:
+                if self._merge_thread is not None and self._merge_thread.is_alive():
+                    return self.merge_path.exists()
+
+                if not self._load_account_info(force=force):
+                    self._last_failure = now
+                    return self.merge_path.exists()
+
+                self._merge_thread = threading.Thread(
+                    target=self._run_background_merge,
+                    args=(now, force),
+                    daemon=True
+                )
+                self._merge_thread.start()
+
+            return self.merge_path.exists()
 
     def _absolute_path_from_rel(self, rel_path: Optional[str]) -> Optional[Path]:
         if not rel_path or self.wechat_root is None:
@@ -4344,29 +4388,72 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
         scan_floor = max(0.0, fallback_floor, startup_floor)
     else:
         scan_floor = max(0.0, fallback_floor, previous_watermark - overlap_sec, startup_floor)
+
+    # Calculate current and previous month in YYYY-MM format to prune scanning
+    now_dt = datetime.fromtimestamp(now)
+    curr_month = now_dt.strftime("%Y-%m")
+    if now_dt.month == 1:
+        prev_month = f"{now_dt.year - 1}-12"
+    else:
+        prev_month = f"{now_dt.year}-{now_dt.month - 1:02d}"
+    allowed_months = {curr_month, prev_month}
+
     newest_mtime = previous_watermark or 0.0
     for root in cfg.watch_roots:
         if not root.exists():
             continue
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            if not is_candidate(p, thumb_candidates_enabled=cfg.thumb_candidates_enabled):
-                continue
-            try:
-                st = p.stat()
-            except FileNotFoundError:
-                continue
-            if float(st.st_mtime) < scan_floor:
-                continue
-            if db.upsert_candidate(
-                p,
-                cfg.settle_seconds,
-                "reconcile",
-                thumb_candidates_enabled=cfg.thumb_candidates_enabled,
-            ):
-                count += 1
-            newest_mtime = max(newest_mtime, float(st.st_mtime))
+
+        # We traverse root using os.walk and prune dirnames in-place to avoid
+        # scanning large folders we don't care about (e.g. Video, File, or old month folders)
+        for dirpath, dirnames, filenames in os.walk(root):
+            abs_parts = [p.lower() for p in Path(dirpath).parts]
+
+            if 'filestorage' in abs_parts:
+                try:
+                    fs_idx = abs_parts.index('filestorage')
+                    depth_from_fs = len(abs_parts) - 1 - fs_idx
+                except ValueError:
+                    depth_from_fs = -1
+
+                if depth_from_fs == 0:
+                    # We are at FileStorage root. Only keep MsgAttach and Temp.
+                    dirnames[:] = [d for d in dirnames if d.lower() in ('msgattach', 'temp')]
+                elif depth_from_fs == 1 and abs_parts[-1] == 'msgattach':
+                    # Inside MsgAttach. Keep all chat hash folders.
+                    pass
+                elif depth_from_fs == 2 and abs_parts[-2] == 'msgattach':
+                    # Inside MsgAttach/<chat_id>. Only keep Image and Thumb.
+                    dirnames[:] = [d for d in dirnames if d.lower() in ('image', 'thumb')]
+                elif depth_from_fs == 3 and abs_parts[-3] == 'msgattach' and abs_parts[-1] in ('image', 'thumb'):
+                    # Inside Image or Thumb. Only keep current and previous month.
+                    dirnames[:] = [d for d in dirnames if d in allowed_months]
+                elif depth_from_fs >= 4 and abs_parts[fs_idx + 1] == 'msgattach' and abs_parts[fs_idx + 3] in ('image', 'thumb'):
+                    pass
+                elif abs_parts[fs_idx + 1] == 'temp':
+                    pass
+                else:
+                    # Ignore any other subdirectory branches
+                    dirnames[:] = []
+
+            for f in filenames:
+                p = Path(dirpath) / f
+                if not is_candidate(p, thumb_candidates_enabled=cfg.thumb_candidates_enabled):
+                    continue
+                try:
+                    st = p.stat()
+                except FileNotFoundError:
+                    continue
+                if float(st.st_mtime) < scan_floor:
+                    continue
+                if db.upsert_candidate(
+                    p,
+                    cfg.settle_seconds,
+                    "reconcile",
+                    thumb_candidates_enabled=cfg.thumb_candidates_enabled,
+                ):
+                    count += 1
+                newest_mtime = max(newest_mtime, float(st.st_mtime))
+
     db.set_meta("reconcile_watermark", f"{max(newest_mtime, now - overlap_sec):.6f}")
     return count
 
