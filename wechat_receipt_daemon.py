@@ -207,6 +207,12 @@ def build_lanc_headers(verification_column_name: str) -> list[str]:
     return [*BASE_LANC_HEADERS]
 
 
+# Light red (#F4CCCC) used to tint rows whose value was guessed/unreadable.
+SHEET_GUESS_COLOR = {"red": 0.957, "green": 0.800, "blue": 0.800}
+# White, used to clear a previous tint when a value becomes trustworthy.
+SHEET_CLEAR_COLOR = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
 def sheet_header_range(headers: list[str]) -> str:
     last_col = chr(ord("A") + max(0, len(headers) - 1))
     return f"A1:{last_col}1"
@@ -1082,10 +1088,20 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix), idx, order, value, currency, raw_value, source, used_compact_fix))
             order += 1
 
+        line_has_datetime = bool(_iter_date_candidates(line) or _iter_time_candidates(line))
         for m in AMOUNT_FALLBACK_PATTERN.finditer(line):
             raw_value = m.group(1)
             if should_skip_candidate(raw_value, "fallback", None):
                 continue
+            # Never let date/time noise become an amount. A year joined to an hour
+            # (e.g. "2026 . 15:12" -> "2026.15") or any bare number sitting on a
+            # date/time line is OCR noise, not a transaction value. We only keep it
+            # when there is an explicit amount hint ("valor", "pix", "total", ...).
+            if not has_direct_hint:
+                if re.fullmatch(r"(?:19|20)\d{2}(?:[.,]\d{1,2})?", raw_value):
+                    continue
+                if line_has_datetime:
+                    continue
             value = normalize_amount(raw_value)
             if value is None:
                 continue
@@ -1256,6 +1272,14 @@ def build_sheet_payload_from_receipt(
             "verification_status": receipt_payload.get("verification_status"),
             "msg_svr_id": receipt_payload.get("msg_svr_id"),
             "talker": receipt_payload.get("talker"),
+            # Narrow "guessed value" signal: the value was either unreadable, or it
+            # came from the unlabeled "fallback" path (no "R$"/keyword) and was not
+            # confirmed by the second high-res read. Used only to tint the row red on
+            # the sheet -- it does NOT add a column and does NOT move the row.
+            "value_uncertain": bool(
+                receipt_payload.get("amount") is None
+                or receipt_payload.get("amount_source") == "fallback"
+            ),
         }
     )
     return payload
@@ -4304,6 +4328,20 @@ class GoogleSheetsSink(RowSink):
             return self.review_worksheet
         return main_title
 
+    def _apply_row_highlight(self, worksheet: Any, row_idx: int, uncertain: bool) -> None:
+        # Tint the whole row light red when the value was guessed/unreadable, or
+        # clear it back to white when the value is trustworthy. Never let a
+        # formatting hiccup break ingestion.
+        row_value = max(2, int(row_idx))
+        color = SHEET_GUESS_COLOR if uncertain else SHEET_CLEAR_COLOR
+        try:
+            worksheet.format(
+                sheet_row_range(self.headers, row_value),
+                {"backgroundColor": color},
+            )
+        except Exception as exc:
+            print(f"[WARN] row_highlight_failed | row={row_value} | err={exc}")
+
     def append(self, row_payload: dict[str, Any], review_needed: bool) -> tuple[str, int]:
         with self._lock:
             title = self._target_sheet(review_needed)
@@ -4315,6 +4353,7 @@ class GoogleSheetsSink(RowSink):
                 table_range=sheet_table_range(self.headers),
             )
             row_idx = len(worksheet.col_values(1))
+            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
             return title, row_idx
 
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
@@ -4329,6 +4368,7 @@ class GoogleSheetsSink(RowSink):
                 values=[build_sink_row_values(row_payload)],
                 value_input_option="USER_ENTERED",
             )
+            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -5215,7 +5255,11 @@ def process_item(
         has_amount = False
         if is_receipt:
             temp_fields = parse_receipt_fields(text, ocr_conf=ocr_conf, q_score=q_score)
-            has_amount = temp_fields.get("amount") is not None
+            # Only a trusted (currency-labeled) amount should block the high-res
+            # re-read. A bare "fallback" number is usually OCR noise (a stray 50,
+            # or year/time leftovers), so we still attempt the raw-image re-OCR to
+            # recover the real value instead of locking in the junk.
+            has_amount = temp_fields.get("amount") is not None and temp_fields.get("amount_source") in ("currency", "currency_compact_cent_fix")
 
         is_preprocessed = (
             img_for_ocr.size != img.size or 
@@ -5493,6 +5537,7 @@ def backfill_missing_receipt_fields(db: StateDB, sink: RowSink, cfg: Config, lim
             "bank": bank,
             "amount": amount,
             "amount_rounded": amount_rounded,
+            "amount_source": amount_source,
             "verification_status": row["verification_status"],
             "msg_svr_id": row["msg_svr_id"],
             "talker": row["talker"],
