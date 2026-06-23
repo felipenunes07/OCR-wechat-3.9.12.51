@@ -1011,7 +1011,6 @@ class ManualOpenOnlyCleanupTests(unittest.TestCase):
             finally:
                 db.close()
 
-
 class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
     def test_parse_merge_runner_output_reads_prefixed_json(self) -> None:
         output = "\n".join(
@@ -1045,24 +1044,32 @@ class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
         resolver._last_failure = 0.0
         resolver._last_error = None
         resolver._lock = threading.Lock()
+        resolver._merge_thread = None
+        resolver._merge_thread_lock = threading.Lock()
         resolver._load_account_info = lambda force=False: True
         return resolver
+
+    def _refresh_and_join(self, resolver, force: bool = False) -> bool:
+        ret = resolver.refresh_if_due(force=force)
+        if resolver._merge_thread is not None:
+            resolver._merge_thread.join()
+        return ret
 
     def test_refresh_if_due_backs_off_after_failed_merge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             resolver = self._build_resolver(tmp_dir)
             merge_calls: list[str] = []
 
-            def fake_merge() -> tuple[bool, str]:
+            def fake_merge(target_path) -> tuple[bool, str]:
                 merge_calls.append("merge")
                 return False, "timeout"
 
-            resolver._merge_real_time_db_with_timeout = fake_merge
+            resolver._merge_real_time_db_with_timeout_path = fake_merge
 
-            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 105.0, 170.0]):
-                self.assertFalse(resolver.refresh_if_due())
-                self.assertFalse(resolver.refresh_if_due())
-                self.assertFalse(resolver.refresh_if_due())
+            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 100.0, 105.0, 170.0, 170.0]):
+                self.assertFalse(self._refresh_and_join(resolver))
+                self.assertFalse(self._refresh_and_join(resolver))
+                self.assertFalse(self._refresh_and_join(resolver))
 
             self.assertEqual(merge_calls, ["merge", "merge"])
             self.assertEqual(resolver.last_error, "merge_failed:timeout")
@@ -1072,21 +1079,21 @@ class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             resolver = self._build_resolver(tmp_dir)
             merge_calls: list[str] = []
-            results = [(False, "timeout"), (True, str(resolver.merge_path))]
+            results = [(False, "timeout"), (True, "ok")]
 
-            def fake_merge() -> tuple[bool, str]:
+            def fake_merge(target_path) -> tuple[bool, str]:
                 merge_calls.append("merge")
                 ok, ret = results.pop(0)
                 if ok:
-                    resolver.merge_path.write_text("ok", encoding="utf-8")
+                    target_path.write_text("ok", encoding="utf-8")
                 return ok, ret
 
-            resolver._merge_real_time_db_with_timeout = fake_merge
+            resolver._merge_real_time_db_with_timeout_path = fake_merge
 
-            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 170.0, 175.0]):
-                self.assertFalse(resolver.refresh_if_due())
-                self.assertTrue(resolver.refresh_if_due())
-                self.assertTrue(resolver.refresh_if_due())
+            with patch("wechat_receipt_daemon.time.time", side_effect=[100.0, 100.0, 170.0, 170.0, 175.0]):
+                self.assertFalse(self._refresh_and_join(resolver))
+                self.assertFalse(self._refresh_and_join(resolver))
+                self.assertTrue(self._refresh_and_join(resolver))
 
             self.assertEqual(merge_calls, ["merge", "merge"])
             self.assertEqual(resolver._last_failure, 0.0)

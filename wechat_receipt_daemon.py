@@ -452,6 +452,23 @@ AMOUNT_NEGATIVE_HINTS = (
     "codigo",
     "protocolo",
     "id",
+    # Banners de propaganda/assistente (ex.: Mercado Pago "R$ 50 para Ana -
+    # Assistente pessoal, baixe o app e conheca") nao sao o valor do comprovante.
+    "assistente",
+    "baixe",
+    "conheca",
+)
+# Marcadores do bloco de propaganda/assistente. Quando um valor esta colado a uma
+# palavra (ex.: "50para Ana") E o contexto tem um desses marcadores, ele e
+# descartado de vez -- e sugestao do app, nunca o valor do comprovante.
+AMOUNT_PROMO_MARKERS = (
+    "assistente",
+    "baixe",
+    "conheca",
+    "mensagem",
+    "audio",
+    "faca um",
+    "facaum",
 )
 MONTH_TOKEN_MAP = {
     "JAN": 1,
@@ -1036,7 +1053,13 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
         has_direct_hint = any(token in part for part in (prev_low, line_low, next_low) for token in AMOUNT_DIRECT_HINTS)
         has_negative_hint = any(token in context_low for token in AMOUNT_NEGATIVE_HINTS)
 
-        def score_candidate(raw_value: str, currency: Optional[str], source: str, used_compact_fix: bool) -> int:
+        def score_candidate(
+            raw_value: str,
+            currency: Optional[str],
+            source: str,
+            used_compact_fix: bool,
+            followed_by_letter: bool = False,
+        ) -> int:
             score = 30 if source == "currency" else 18
             if any(token in prev_low for token in AMOUNT_DIRECT_HINTS):
                 score += 18
@@ -1046,6 +1069,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 score += 4
             if any(token in context_low for token in AMOUNT_NEGATIVE_HINTS):
                 score -= 14
+            # A real amount is never glued to a word. "R$ 50para Ana" (a Mercado
+            # Pago suggestion banner) is promo text, not the receipt value.
+            if followed_by_letter:
+                score -= 25
             if re.search(r"[.,]\d{1,2}$", raw_value):
                 score += 4
             if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?", raw_value):
@@ -1085,7 +1112,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                     source = "currency_compact_cent_fix"
             if value is None:
                 continue
-            candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix), idx, order, value, currency, raw_value, source, used_compact_fix))
+            followed_by_letter = line[m.end(2):m.end(2) + 1].isalpha()
+            if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
+                continue  # promo/assistant banner amount (e.g. "R$ 50para Ana") -> ignore
+            candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter), idx, order, value, currency, raw_value, source, used_compact_fix))
             order += 1
 
         line_has_datetime = bool(_iter_date_candidates(line) or _iter_time_candidates(line))
@@ -1105,7 +1135,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             if value is None:
                 continue
-            candidates.append((score_candidate(raw_value, None, "fallback", False), idx, order, value, None, raw_value, "fallback", False))
+            followed_by_letter = line[m.end(1):m.end(1) + 1].isalpha()
+            if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
+                continue  # promo/assistant banner amount (e.g. "50para Ana") -> ignore
+            candidates.append((score_candidate(raw_value, None, "fallback", False, followed_by_letter), idx, order, value, None, raw_value, "fallback", False))
             order += 1
 
     if not candidates:
