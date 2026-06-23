@@ -5328,11 +5328,10 @@ def process_item(
         has_amount = False
         if is_receipt:
             temp_fields = parse_receipt_fields(text, ocr_conf=ocr_conf, q_score=q_score)
-            # Only a trusted (currency-labeled) amount should block the high-res
-            # re-read. A bare "fallback" number is usually OCR noise (a stray 50,
-            # or year/time leftovers), so we still attempt the raw-image re-OCR to
-            # recover the real value instead of locking in the junk.
-            has_amount = temp_fields.get("amount") is not None and temp_fields.get("amount_source") in ("currency", "currency_compact_cent_fix")
+            # Re-read the raw image only when no amount was found at all. The bad
+            # values we saw (50/2026/CNPJ) are now fixed at the parser level, so the
+            # extra second OCR pass is no longer worth its cost here.
+            has_amount = temp_fields.get("amount") is not None
 
         is_preprocessed = (
             img_for_ocr.size != img.size or 
