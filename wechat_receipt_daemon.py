@@ -1116,8 +1116,8 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             if after_char == "/":
                 continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
             followed_by_letter = after_char.isalpha()
-            if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
-                continue  # promo/assistant banner amount (e.g. "R$ 50para Ana") -> ignore
+            if any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
+                continue  # promo/assistant banner amount (e.g. "R$ 50 para Ana") -> ignore
             candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter), idx, order, value, currency, raw_value, source, used_compact_fix))
             order += 1
 
@@ -1142,8 +1142,8 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             if after_char == "/":
                 continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
             followed_by_letter = after_char.isalpha()
-            if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
-                continue  # promo/assistant banner amount (e.g. "50para Ana") -> ignore
+            if any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
+                continue  # promo/assistant banner amount (e.g. "50 para Ana") -> ignore
             candidates.append((score_candidate(raw_value, None, "fallback", False, followed_by_letter), idx, order, value, None, raw_value, "fallback", False))
             order += 1
 
