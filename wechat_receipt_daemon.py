@@ -1112,7 +1112,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                     source = "currency_compact_cent_fix"
             if value is None:
                 continue
-            followed_by_letter = line[m.end(2):m.end(2) + 1].isalpha()
+            after_char = line[m.end(2):m.end(2) + 1]
+            if after_char == "/":
+                continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
+            followed_by_letter = after_char.isalpha()
             if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
                 continue  # promo/assistant banner amount (e.g. "R$ 50para Ana") -> ignore
             candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter), idx, order, value, currency, raw_value, source, used_compact_fix))
@@ -1135,7 +1138,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             if value is None:
                 continue
-            followed_by_letter = line[m.end(1):m.end(1) + 1].isalpha()
+            after_char = line[m.end(1):m.end(1) + 1]
+            if after_char == "/":
+                continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
+            followed_by_letter = after_char.isalpha()
             if followed_by_letter and any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
                 continue  # promo/assistant banner amount (e.g. "50para Ana") -> ignore
             candidates.append((score_candidate(raw_value, None, "fallback", False, followed_by_letter), idx, order, value, None, raw_value, "fallback", False))
@@ -3235,6 +3241,30 @@ class StateDB:
             row = self._conn.execute("SELECT 1 FROM receipts WHERE sha256=? LIMIT 1", (sha256,)).fetchone()
             return row is not None
 
+    def receipt_sha_exists_other(self, sha256: str, exclude_file_id: str, client: Optional[str] = None) -> bool:
+        """True if some OTHER file already produced a receipt with this exact image
+        for the same client.
+
+        Same sha256 = byte-for-byte identical image = the same receipt. We also match
+        the client so the very same screenshot could still be logged for two
+        different clients, but never twice for the same one. Used to stop the same
+        screenshot from being written to the sheet twice.
+        """
+        if not sha256:
+            return False
+        with self._lock:
+            if client is None:
+                row = self._conn.execute(
+                    "SELECT 1 FROM receipts WHERE sha256=? AND file_id<>? LIMIT 1",
+                    (sha256, str(exclude_file_id)),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT 1 FROM receipts WHERE sha256=? AND file_id<>? AND IFNULL(client,'')=? LIMIT 1",
+                    (sha256, str(exclude_file_id), str(client)),
+                ).fetchone()
+            return row is not None
+
     def insert_receipt(self, payload: dict[str, Any]) -> None:
         with self._lock:
             self._conn.execute(
@@ -5273,6 +5303,16 @@ def process_item(
         img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
+
+        # Dedup: if this exact image (same sha256) already produced a receipt from
+        # another file, do not process/write it again. This stops the same
+        # screenshot from being committed to the sheet twice.
+        if db.receipt_sha_exists_other(digest, item.file_id, client):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
+            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
+            print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
+            return
+
         q_score = quality_score(img)
 
         prep_started_at = time.perf_counter()
