@@ -5304,14 +5304,12 @@ def process_item(
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
 
-        # Dedup: if this exact image (same sha256) already produced a receipt from
-        # another file, do not process/write it again. This stops the same
-        # screenshot from being committed to the sheet twice.
-        if db.receipt_sha_exists_other(digest, item.file_id, client):
-            db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
-            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
-            print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
-            return
+        # Dedup check disabled per user request to allow duplicates if the client sends the same screenshot twice.
+        # if db.receipt_sha_exists_other(digest, item.file_id, client):
+        #     db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
+        #     db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
+        #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
+        #     return
 
         q_score = quality_score(img)
 
