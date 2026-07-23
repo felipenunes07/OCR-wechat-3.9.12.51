@@ -1,0 +1,6 @@
+LINHAS COM DATA ANTIGA LANCADAS HOJE (madrugada 22/07) NA Página1: 0
+(total lancado na madrugada: 0)
+
+linha | cliente | valor | data
+
+DICA: apague de baixo para cima (linha maior primeiro) para os numeros nao mudarem.

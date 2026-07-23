@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -156,6 +157,81 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertEqual(fields["amount"], 668.04)
         self.assertEqual(fields["amount_rounded"], 668.0)
         self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
+
+    def test_mercado_pago_superscript_cent_reads_three_digit_value(self) -> None:
+        # Real OCR text: MP renders cents as small superscript digits that OCR glues
+        # onto the value ("R$ 837" + superscript 4 -> "R$ 8374"). Value is 837,4.
+        text = "\n".join(
+            [
+                "mercado",
+                "pago",
+                "Comprovante de Pix",
+                "22/julho/2026as15:55:44.",
+                "R$ 8374",
+                "De",
+                "20.914.890CARISAGONCALVESDE",
+                "Para",
+                "Amd RepresentacoeseServicosLtda",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 837.4)
+        self.assertEqual(fields["amount_rounded"], 837.0)
+        self.assertEqual(fields["amount_source"], "currency_superscript_cent_fix")
+
+    def test_non_mercado_pago_compact_cent_fix_still_splits_two_digits(self) -> None:
+        text = "\n".join(
+            [
+                "Comprovante de Pix",
+                "20/marco/2026 as 11h35.",
+                "R$ 8374",
+                "Banco Bradesco",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 83.74)
+        self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
+
+    def test_tarifa_zero_line_never_beats_valor_line(self) -> None:
+        # Real OCR text (Bradesco net empresa): "Tarifa: R$ 0,00" sits right under
+        # "Dados da transferencia" and used to outscore the real value.
+        text = "\n".join(
+            [
+                "Comprovante de Transacao Bancaria",
+                "Transferir",
+                "bradesco",
+                "Datada operacao:21/07/2026-08h38",
+                "Dados da",
+                "transferencia",
+                "Tarifa: R$ 0,00",
+                "Valor: R$ 4.917,33",
+                "Midia:BRADESCONETEMPRESA",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 4917.33)
+        self.assertEqual(fields["amount_source"], "currency")
+
+    def test_nonzero_tarifa_line_never_beats_valor_line(self) -> None:
+        text = "\n".join(
+            [
+                "Dados da",
+                "transferencia",
+                "Tarifa:R$ 9,80",
+                "Valor:",
+                "R$90.000,00",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 90000.0)
 
     def test_parses_compact_alpha_month_datetime(self) -> None:
         text = "\n".join(
@@ -706,17 +782,19 @@ class ManualSessionOrderTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_claim_next_orders_current_manual_session_by_message_time(self) -> None:
+    def test_claim_next_orders_current_manual_session_by_opening_order(self) -> None:
+        # The sheet must follow the operator's opening order (file mtime), even when
+        # message send-times point the other way.
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = StateDB(Path(tmp_dir) / "state.db")
             try:
                 insert_file_row(
                     db,
-                    file_id="newer-file",
-                    path="C:/fake/newer-file.dat",
+                    file_id="opened-first",
+                    path="C:/fake/opened-first.dat",
                     source_kind="msgattach_image_dat",
                     status="pending",
-                    first_seen=1000.0,
+                    first_seen=1000.0,  # helper also uses this as mtime
                     last_error=None,
                     msg_svr_id="newer-msg",
                     talker="27837425841@chatroom",
@@ -726,8 +804,8 @@ class ManualSessionOrderTests(unittest.TestCase):
                 )
                 insert_file_row(
                     db,
-                    file_id="older-file",
-                    path="C:/fake/older-file.dat",
+                    file_id="opened-second",
+                    path="C:/fake/opened-second.dat",
                     source_kind="msgattach_image_dat",
                     status="pending",
                     first_seen=1002.0,
@@ -742,13 +820,13 @@ class ManualSessionOrderTests(unittest.TestCase):
                 with patch("wechat_receipt_daemon.time.time", return_value=1010.0):
                     first_claim = db.claim_next(manual_session_id="session-a")
                 self.assertIsNotNone(first_claim)
-                self.assertEqual(first_claim.file_id, "older-file")
+                self.assertEqual(first_claim.file_id, "opened-first")
 
-                db.mark_done("older-file", sha256="sha-old", processed_at=1010.0)
+                db.mark_done("opened-first", sha256="sha-old", processed_at=1010.0)
                 with patch("wechat_receipt_daemon.time.time", return_value=1011.0):
                     second_claim = db.claim_next(manual_session_id="session-a")
                 self.assertIsNotNone(second_claim)
-                self.assertEqual(second_claim.file_id, "newer-file")
+                self.assertEqual(second_claim.file_id, "opened-second")
             finally:
                 db.close()
 
@@ -1098,6 +1176,121 @@ class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
             self.assertEqual(merge_calls, ["merge", "merge"])
             self.assertEqual(resolver._last_failure, 0.0)
             self.assertIsNone(resolver.last_error)
+
+
+class OpeningOrderCommitGateTests(unittest.TestCase):
+    """Receipts must reach the sheet in the operator's opening order (file mtime),
+    regardless of which one finished OCR first."""
+
+    def _seed(self, db: StateDB, file_id: str, mtime: float, status: str, ingested_at: float | None = None) -> None:
+        insert_file_row(
+            db,
+            file_id=file_id,
+            path=f"C:/fake/{file_id}.dat",
+            source_kind="msgattach_image_dat",
+            status=status,
+            first_seen=mtime,  # helper uses this value for mtime as well
+            last_error=None,
+        )
+        if ingested_at is not None:
+            db.insert_receipt(
+                build_receipt_payload(
+                    file_id=file_id,
+                    ingested_at=ingested_at,
+                    msg_svr_id=f"msg-{file_id}",
+                    msg_create_time=0.0,
+                    amount=10.0,
+                    amount_rounded=10.0,
+                )
+            )
+
+    def test_commit_follows_opening_order_not_ingestion_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                # Opened first (mtime 100) but OCR finished last (ingested 220);
+                # opened second (mtime 110) finished first (ingested 210).
+                self._seed(db, "opened-first", mtime=100.0, status="done", ingested_at=220.0)
+                self._seed(db, "opened-second", mtime=110.0, status="done", ingested_at=210.0)
+
+                first = db.claim_next_sink_receipt()
+                self.assertIsNotNone(first)
+                self.assertEqual(first["file_id"], "opened-first")
+            finally:
+                db.close()
+
+    def test_gate_waits_for_earlier_opened_file_still_processing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                now = time.time()
+                # Earlier-opened image still being read; later one already staged.
+                self._seed(db, "slow-first", mtime=now - 30.0, status="processing")
+                self._seed(db, "fast-second", mtime=now - 20.0, status="done", ingested_at=now)
+
+                self.assertIsNone(db.claim_next_sink_receipt())
+                row = db._conn.execute(
+                    "SELECT sheet_status, sheet_last_error FROM receipts WHERE file_id='fast-second'"
+                ).fetchone()
+                self.assertEqual(row["sheet_status"], "SINK_BLOCKED_PRIOR_MSG")
+                self.assertIn("WAITING_PRIOR_OPEN_FILE:slow-first", row["sheet_last_error"])
+
+                # Once the earlier receipt lands, the order unblocks naturally.
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="slow-first",
+                        ingested_at=now,
+                        msg_svr_id="msg-slow-first",
+                        msg_create_time=0.0,
+                        amount=5.0,
+                        amount_rounded=5.0,
+                    )
+                )
+                db.mark_done("slow-first", sha256="s", processed_at=now)
+                first = db.claim_next_sink_receipt()
+                self.assertIsNotNone(first)
+                self.assertEqual(first["file_id"], "slow-first")
+                db.mark_receipt_sink_committed("slow-first", "Página1", 2, committed_at=now)
+                second = db.claim_next_sink_receipt()
+                self.assertIsNotNone(second)
+                self.assertEqual(second["file_id"], "fast-second")
+            finally:
+                db.close()
+
+    def test_gate_releases_when_earlier_file_stalls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                now = time.time()
+                # Earlier-opened candidate stuck in retry for far longer than the
+                # stall window: it must stop blocking the queue.
+                self._seed(db, "stuck-first", mtime=now - 600.0, status="retry")
+                self._seed(db, "healthy-second", mtime=now - 20.0, status="done", ingested_at=now)
+
+                claimed = db.claim_next_sink_receipt()
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed["file_id"], "healthy-second")
+            finally:
+                db.close()
+
+    def test_gate_waits_for_earlier_staged_receipt_in_retry_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                now = time.time()
+                self._seed(db, "first-staged", mtime=now - 40.0, status="done", ingested_at=now - 5.0)
+                self._seed(db, "second-staged", mtime=now - 30.0, status="done", ingested_at=now - 4.0)
+                # First one hit a sink error and is backing off into the future.
+                db.mark_receipt_sink_retry("first-staged", "APIError: quota", delay_sec=60)
+
+                self.assertIsNone(db.claim_next_sink_receipt())
+                row = db._conn.execute(
+                    "SELECT sheet_status, sheet_last_error FROM receipts WHERE file_id='second-staged'"
+                ).fetchone()
+                self.assertEqual(row["sheet_status"], "SINK_BLOCKED_PRIOR_MSG")
+                self.assertIn("WAITING_PRIOR_OPEN_RECEIPT:first-staged", row["sheet_last_error"])
+            finally:
+                db.close()
 
 
 class StaleProcessingRecoveryTests(unittest.TestCase):

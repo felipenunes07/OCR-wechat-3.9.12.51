@@ -84,6 +84,10 @@ DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
 MANUAL_SESSION_ID_META_KEY = "manual_session_id"
+# The sheet must follow the operator's opening order. A receipt only commits when no
+# image opened before it is still unread; a candidate stalled longer than this stops
+# blocking so one broken file cannot freeze the whole sheet.
+OPEN_ORDER_STALL_SECONDS = 90
 REALTIME_SOURCE_EVENTS = {"created", "modified", "ui-force"}
 MANUAL_OPEN_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "temp_image"}
 MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
@@ -435,6 +439,15 @@ AMOUNT_DIRECT_HINTS = (
     "enviado",
     "recebido",
     "total",
+)
+# A label on the candidate's OWN line marking it as a fee. Stronger than the
+# context-wide negative hints: "Tarifa: R$ 0,00" sits right next to strong amount
+# hints ("Dados da transferencia") and used to outscore the real "Valor:" line.
+AMOUNT_FEE_LINE_HINTS = (
+    "tarifa",
+    "taxa",
+    "juros",
+    "iof",
 )
 AMOUNT_NEGATIVE_HINTS = (
     "tarifa",
@@ -1043,6 +1056,11 @@ class AmountParseResult:
 def extract_best_amount(lines: list[str]) -> AmountParseResult:
     candidates: list[tuple[int, int, int, float, Optional[str], str, str, bool]] = []
     order = 0
+    full_text_low = " ".join(lines).lower()
+    # Mercado Pago prints cents as small superscript digits that OCR glues onto the
+    # value ("R$ 837" + superscript "4" -> "R$ 8374"). Thousands always keep their
+    # dot ("R$ 8.374"), so a glued no-separator token needs cent reconstruction.
+    is_mercado_pago = "mercado" in full_text_low and "pago" in full_text_low
     for idx, line in enumerate(lines):
         prev2_low = lines[idx - 2].lower() if idx > 1 else ""
         prev_low = lines[idx - 1].lower() if idx > 0 else ""
@@ -1069,6 +1087,14 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 score += 4
             if any(token in context_low for token in AMOUNT_NEGATIVE_HINTS):
                 score -= 14
+            # An amount labeled on its own line as a fee ("Tarifa: R$ 0,00") is not
+            # the transaction value, even when neighbouring lines carry strong hints.
+            if any(token in line_low for token in AMOUNT_FEE_LINE_HINTS):
+                score -= 30
+            # A payment of R$ 0,00 does not exist; zero values are always fee lines
+            # or OCR noise and must never win over a positive candidate.
+            if re.fullmatch(r"0+(?:[.,]0+)?", raw_value):
+                score -= 60
             # A real amount is never glued to a word. "R$ 50para Ana" (a Mercado
             # Pago suggestion banner) is promo text, not the receipt value.
             if followed_by_letter:
@@ -1105,11 +1131,20 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             source = "currency"
             if should_apply_compact_cent_fix(raw_value, currency, context_low):
-                compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
+                if is_mercado_pago and len(raw_value) == 4 and raw_value.isdigit():
+                    # Mercado Pago prints cents as small superscript digits that OCR
+                    # glues onto the value, and thousands always keep their dot
+                    # ("R$ 8.374"). A glued 4-digit token is therefore a 3-digit value
+                    # plus one captured cent digit: "8374" -> 837,4 (not 83,74).
+                    compact_value = normalize_amount(f"{raw_value[:3]},{raw_value[3:]}")
+                    compact_source = "currency_superscript_cent_fix"
+                else:
+                    compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
+                    compact_source = "currency_compact_cent_fix"
                 if compact_value is not None:
                     value = compact_value
                     used_compact_fix = True
-                    source = "currency_compact_cent_fix"
+                    source = compact_source
             if value is None:
                 continue
             after_char = line[m.end(2):m.end(2) + 1]
@@ -1287,7 +1322,7 @@ def compute_review_needed(
         or verification_status != "CONFIRMADO"
         or fields.get("txn_date_source") != "parsed"
         or fields.get("txn_time_source") != "parsed"
-        or fields.get("amount_source") == "currency_compact_cent_fix"
+        or fields.get("amount_source") in ("currency_compact_cent_fix", "currency_superscript_cent_fix")
     )
 
 
@@ -2900,11 +2935,12 @@ class StateDB:
                         WHEN 'msgattach_thumb_dat' THEN 3
                         ELSE 4
                     END ASC,
-                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN 0 ELSE 1 END ASC,
-                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_create_time END ASC,
-                    CASE WHEN f.msg_create_time IS NOT NULL AND f.msg_create_time > 0 THEN f.msg_svr_id END ASC,
-                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.first_seen END ASC,
-                    CASE WHEN f.msg_create_time IS NULL OR f.msg_create_time <= 0 THEN f.mtime END ASC,
+                    -- Opening order: the image file is written the moment the operator
+                    -- opens it in WeChat, so mtime is the "abertura" sequence the sheet
+                    -- must follow. (Reconcile sweeps otherwise discover files in random
+                    -- hash order, and retries would reshuffle first_seen.)
+                    f.mtime ASC,
+                    f.first_seen ASC,
                     f.next_attempt ASC
                 LIMIT 1
                 """,
@@ -3405,7 +3441,8 @@ class StateDB:
                 f"""
                 SELECT r.file_id, r.source_path, r.ingested_at, r.review_needed, r.msg_svr_id, r.talker,
                        r.msg_create_time, r.manual_session_id, r.client, r.txn_date, r.txn_time, r.bank, r.amount, r.amount_rounded, r.verification_status,
-                       r.sheet_payload_json, r.sheet_status, f.first_seen AS source_first_seen
+                       r.sheet_payload_json, r.sheet_status, f.first_seen AS source_first_seen,
+                       f.mtime AS source_mtime
                 FROM receipts AS r
                 LEFT JOIN files AS f
                   ON f.file_id = r.file_id
@@ -3422,11 +3459,10 @@ class StateDB:
                         WHEN ? > 0 THEN 1
                         ELSE 0
                     END ASC,
-                    CASE
-                        WHEN r.talker IS NOT NULL AND r.talker <> '' AND r.msg_create_time IS NOT NULL AND r.msg_create_time > 0
-                            THEN 0
-                        ELSE 1
-                    END ASC,
+                    -- Opening order first: the source file's mtime is the moment the
+                    -- operator opened the image in WeChat, and the sheet must follow
+                    -- that sequence ("ordem de abertura"), not OCR-completion order.
+                    COALESCE(f.mtime, r.ingested_at) ASC,
                     {order_by},
                     r.ingested_at ASC
                 """,
@@ -3447,8 +3483,51 @@ class StateDB:
                 talker = str(row["talker"] or "").strip() or None
                 msg_create_time = float(row["msg_create_time"] or 0.0)
                 receipt_session_id = str(row["manual_session_id"] or "").strip() or None
+                source_mtime = float(row["source_mtime"] or 0.0)
                 blocker_note: Optional[str] = None
-                if scope == "per_talker" and talker and msg_create_time > 0:
+
+                if source_mtime > 0:
+                    # Opening-order gate: never commit this row while an image opened
+                    # BEFORE it (earlier file mtime) is still being read. A candidate
+                    # that stalls (held/retrying for over OPEN_ORDER_STALL_SECONDS)
+                    # stops blocking so one bad file cannot freeze the sheet.
+                    prior_open = cur.execute(
+                        """
+                        SELECT file_id
+                        FROM files
+                        WHERE source_kind IN ('msgattach_image_dat', 'msgattach_image_plain')
+                          AND file_id <> ?
+                          AND status IN ('pending', 'retry', 'processing')
+                          AND mtime < ?
+                          AND (status = 'processing' OR COALESCE(first_seen, 0) >= ?)
+                        ORDER BY mtime ASC
+                        LIMIT 1
+                        """,
+                        (file_id, source_mtime, float(now - OPEN_ORDER_STALL_SECONDS)),
+                    ).fetchone()
+                    if prior_open is not None:
+                        blocker_note = f"WAITING_PRIOR_OPEN_FILE:{str(prior_open['file_id'])}"
+                    else:
+                        # Also wait for receipts already staged from an earlier-opened
+                        # image that have not committed yet (e.g. a sink retry backoff).
+                        prior_receipt = cur.execute(
+                            """
+                            SELECT r2.file_id
+                            FROM receipts AS r2
+                            JOIN files AS f2 ON f2.file_id = r2.file_id
+                            WHERE COALESCE(r2.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                              AND r2.file_id <> ?
+                              AND COALESCE(f2.mtime, 0) > 0
+                              AND f2.mtime < ?
+                            ORDER BY f2.mtime ASC
+                            LIMIT 1
+                            """,
+                            (file_id, source_mtime),
+                        ).fetchone()
+                        if prior_receipt is not None:
+                            blocker_note = f"WAITING_PRIOR_OPEN_RECEIPT:{str(prior_receipt['file_id'])}"
+
+                if blocker_note is None and scope == "per_talker" and talker and msg_create_time > 0:
                     prior_sink = self.find_prior_pending_sink_receipt(
                         talker=talker,
                         msg_create_time=msg_create_time,
