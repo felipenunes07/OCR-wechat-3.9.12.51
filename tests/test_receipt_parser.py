@@ -437,6 +437,25 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         fields = parse_receipt_fields(text, ocr_conf=0.95, q_score=0.9)
         self.assertEqual(fields["amount"], 730.0)
 
+    def test_row_color_priority(self) -> None:
+        from wechat_receipt_daemon import (
+            SHEET_CLEAR_COLOR,
+            SHEET_GUESS_COLOR,
+            SHEET_NO_BANK_COLOR,
+            SHEET_PDF_COLOR,
+            sheet_row_color,
+        )
+
+        self.assertEqual(sheet_row_color({"bank": "AMD", "amount": 10.0}), SHEET_CLEAR_COLOR)
+        self.assertEqual(sheet_row_color({"bank": None, "amount": 10.0}), SHEET_NO_BANK_COLOR)
+        self.assertEqual(sheet_row_color({"bank": "AMD", "amount": 10.0, "is_pdf": True}), SHEET_PDF_COLOR)
+        # Unknown bank outranks the informational PDF blue.
+        self.assertEqual(sheet_row_color({"bank": "", "amount": 10.0, "is_pdf": True}), SHEET_NO_BANK_COLOR)
+        # Guessed value outranks everything.
+        self.assertEqual(
+            sheet_row_color({"bank": None, "value_uncertain": True, "is_pdf": True}), SHEET_GUESS_COLOR
+        )
+
     def test_single_receipt_is_not_split(self) -> None:
         from wechat_receipt_daemon import OCRSpan, split_receipt_segments
 

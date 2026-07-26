@@ -223,14 +223,19 @@ def build_lanc_headers(verification_column_name: str) -> list[str]:
 SHEET_GUESS_COLOR = {"red": 0.957, "green": 0.800, "blue": 0.800}
 # Light blue (#CFE2F3) used to tint rows that came from a PDF receipt.
 SHEET_PDF_COLOR = {"red": 0.812, "green": 0.886, "blue": 0.953}
+# Light gray (#D9D9D9): destination bank not recognized (not AMD/CLEEND/...),
+# so the receipt may have been paid to the wrong account.
+SHEET_NO_BANK_COLOR = {"red": 0.851, "green": 0.851, "blue": 0.851}
 # White, used to clear a previous tint when a value becomes trustworthy.
 SHEET_CLEAR_COLOR = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 
 def sheet_row_color(row_payload: dict[str, Any]) -> dict[str, float]:
-    # Red (guessed value) always wins over the informational PDF blue.
+    # Priority: red (guessed value) > orange (unknown bank) > blue (PDF) > white.
     if row_payload.get("value_uncertain"):
         return SHEET_GUESS_COLOR
+    if not str(row_payload.get("bank") or "").strip():
+        return SHEET_NO_BANK_COLOR
     if row_payload.get("is_pdf"):
         return SHEET_PDF_COLOR
     return SHEET_CLEAR_COLOR
