@@ -297,6 +297,63 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         xlsx = Path(r"C:\Users\x\Documents\WeChat Files\wxid_a\FileStorage\File\2026-07\planilha.xlsx")
         self.assertEqual(detect_source_kind(xlsx), "other")
 
+    def test_photo_with_six_deposit_slips_splits_into_six_receipts(self) -> None:
+        # Real scenario 26/07/2026: client photographs six Banco do Brasil deposit
+        # slips in a 2-column x 3-row grid. Reading OCR output top-to-bottom
+        # interleaves the columns; the spatial splitter must yield one receipt
+        # per slip, each with its own value.
+        from wechat_receipt_daemon import OCRSpan, split_receipt_segments
+
+        def slip(x0: float, y0: float, hora: str, valor: str) -> list[OCRSpan]:
+            def span(dx: float, dy: float, text: str, w: float = 300.0) -> OCRSpan:
+                return OCRSpan(left=x0 + dx, top=y0 + dy, right=x0 + dx + w, bottom=y0 + dy + 18, text=text, conf=0.95)
+
+            return [
+                span(0, 0, f"22/07/2026 - BANCO DO BRASIL - {hora}"),
+                span(0, 22, "COMPROVANTE DE DEPOSITO EM CONTA CORRENTE"),
+                span(0, 44, "EM DINHEIRO"),
+                span(0, 66, "CLIENTE: AMD R SERVICOS LTDA"),
+                span(0, 88, "DATA :"),
+                span(220, 88, "22/07/2026", w=110),
+                span(0, 110, "VALOR DINHEIRO"),
+                span(220, 110, valor, w=110),
+                span(0, 132, "VALOR TOTAL"),
+                span(220, 132, valor, w=110),
+            ]
+
+        spans: list[OCRSpan] = []
+        valores = ["1.850,00", "1.900,00", "2.000,00", "2.000,00", "1.750,00", "50,00"]
+        horas = ["09:51:18", "09:43:06", "09:46:42", "09:47:39", "09:48:58", "09:58:23"]
+        i = 0
+        for row in range(3):
+            for col in range(2):
+                spans.extend(slip(60 + col * 480, 40 + row * 260, horas[i], valores[i]))
+                i += 1
+        # Interleave like real OCR (sorted top-to-bottom) to prove order doesn't matter.
+        spans.sort(key=lambda s: (s.top, s.left))
+
+        segments = split_receipt_segments(spans)
+        self.assertEqual(len(segments), 6)
+        parsed = []
+        for seg in segments:
+            ok, reason = looks_like_single_receipt(seg)
+            self.assertTrue(ok, reason)
+            fields = parse_receipt_fields(seg, ocr_conf=0.95, q_score=0.9)
+            parsed.append((fields["amount"], fields["txn_time"]))
+        self.assertEqual(sorted(v for v, _ in parsed), [50.0, 1750.0, 1850.0, 1900.0, 2000.0, 2000.0])
+        self.assertIn(("1850.0", "09:51")[0] and 1850.0, [v for v, _ in parsed])
+        self.assertEqual(sorted(t for _, t in parsed), sorted(["09:51", "09:43", "09:46", "09:47", "09:48", "09:58"]))
+
+    def test_single_receipt_is_not_split(self) -> None:
+        from wechat_receipt_daemon import OCRSpan, split_receipt_segments
+
+        spans = [
+            OCRSpan(10, 10, 300, 28, "Comprovante de Pix", 0.9),
+            OCRSpan(10, 40, 200, 58, "R$ 933,00", 0.9),
+            OCRSpan(10, 70, 200, 88, "Valor", 0.9),
+        ]
+        self.assertEqual(split_receipt_segments(spans), [])
+
     def test_non_mercado_pago_compact_cent_fix_still_splits_two_digits(self) -> None:
         text = "\n".join(
             [

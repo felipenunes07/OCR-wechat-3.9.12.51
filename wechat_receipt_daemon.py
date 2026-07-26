@@ -369,11 +369,33 @@ def quality_score(img: Image.Image) -> float:
     return round(max(0.0, min(1.0, score)), 4)
 
 
+@dataclass(frozen=True)
+class OCRSpan:
+    left: float
+    top: float
+    right: float
+    bottom: float
+    text: str
+    conf: float
+
+    @property
+    def x(self) -> float:
+        return (self.left + self.right) / 2.0
+
+    @property
+    def y(self) -> float:
+        return (self.top + self.bottom) / 2.0
+
+
 class OCREngine:
     name = "none"
 
     def extract(self, img: Image.Image) -> tuple[str, float]:
         raise NotImplementedError
+
+    def extract_detailed(self, img: Image.Image) -> Optional[list[OCRSpan]]:
+        # Engines without box output return None; callers fall back to extract().
+        return None
 
 
 class RapidOCREngine(OCREngine):
@@ -385,24 +407,43 @@ class RapidOCREngine(OCREngine):
         self._ocr = RapidOCR()
 
     def extract(self, img: Image.Image) -> tuple[str, float]:
+        spans = self.extract_detailed(img)
+        if not spans:
+            return "", 0.0
+        text = "\n".join(s.text for s in spans if s.text.strip())
+        confs = [s.conf for s in spans]
+        conf = (sum(confs) / len(confs)) if confs else 0.5
+        return text, round(max(0.0, min(1.0, conf)), 4)
+
+    def extract_detailed(self, img: Image.Image) -> Optional[list[OCRSpan]]:
         import numpy as np  # type: ignore
 
         arr = np.array(img.convert("RGB"))
         result, _ = self._ocr(arr)
         if not result:
-            return "", 0.0
-        texts: list[str] = []
-        confs: list[float] = []
+            return []
+        spans: list[OCRSpan] = []
         for item in result:
-            if len(item) >= 3:
-                texts.append(str(item[1]))
-                try:
-                    confs.append(float(item[2]))
-                except Exception:
-                    pass
-        text = "\n".join(t for t in texts if t.strip())
-        conf = (sum(confs) / len(confs)) if confs else 0.5
-        return text, round(max(0.0, min(1.0, conf)), 4)
+            if len(item) < 3:
+                continue
+            try:
+                box = item[0]
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+                conf = float(item[2])
+            except Exception:
+                continue
+            spans.append(
+                OCRSpan(
+                    left=min(xs),
+                    top=min(ys),
+                    right=max(xs),
+                    bottom=max(ys),
+                    text=str(item[1]),
+                    conf=conf,
+                )
+            )
+        return spans
 
 
 class TesseractOCREngine(OCREngine):
@@ -1026,6 +1067,74 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
         return (False, "WEAK_RECEIPT_SIGNAL")
 
     return (True, "OK")
+
+
+def _receipt_anchor_norm(text: str) -> str:
+    return re.sub(r"[^a-z]", "", strip_accents(str(text or "").lower()))
+
+
+def split_receipt_segments(spans: list["OCRSpan"]) -> list[str]:
+    """Split one photo containing SEVERAL receipts into per-receipt texts.
+
+    Clients photograph 2-6 printed slips side by side; reading the OCR output
+    top-to-bottom interleaves the columns. Each slip carries a
+    "COMPROVANTE DE ..." header, so those anchors define columns (by x) and
+    receipt regions within a column (by y). Returns [] unless at least two
+    anchors are found.
+    """
+    if not spans:
+        return []
+    anchors = [s for s in spans if "comprovantede" in _receipt_anchor_norm(s.text)]
+    if len(anchors) < 2:
+        return []
+
+    heights = sorted((s.bottom - s.top) for s in spans if s.bottom > s.top)
+    line_h = heights[len(heights) // 2] if heights else 12.0
+    total_left = min(s.left for s in spans)
+    total_right = max(s.right for s in spans)
+    total_width = max(1.0, total_right - total_left)
+
+    # Columns: cluster anchor x-centers; a gap larger than a third of the image
+    # width means a new column of slips.
+    columns: list[list["OCRSpan"]] = []
+    for anchor in sorted(anchors, key=lambda s: s.x):
+        if columns and (anchor.x - columns[-1][-1].x) <= 0.33 * total_width:
+            columns[-1].append(anchor)
+        else:
+            columns.append([anchor])
+
+    col_centers = [sum(a.x for a in col) / len(col) for col in columns]
+
+    def _column_of(span: "OCRSpan") -> int:
+        return min(range(len(col_centers)), key=lambda i: abs(span.x - col_centers[i]))
+
+    spans_by_column: dict[int, list["OCRSpan"]] = {}
+    for s in spans:
+        spans_by_column.setdefault(_column_of(s), []).append(s)
+
+    segments: list[str] = []
+    for col_idx, col_anchors in enumerate(columns):
+        col_spans = spans_by_column.get(col_idx, [])
+        ordered_anchors = sorted(col_anchors, key=lambda s: s.y)
+        for idx, anchor in enumerate(ordered_anchors):
+            # The date/bank line sits a couple of lines ABOVE the header.
+            start_y = anchor.y - 3.0 * line_h
+            end_y = ordered_anchors[idx + 1].y - 3.0 * line_h if idx + 1 < len(ordered_anchors) else float("inf")
+            region = [s for s in col_spans if start_y <= s.y < end_y]
+            if len(region) < 4:
+                continue
+            # Rebuild reading order: bucket spans into visual rows, join by x.
+            bucket = max(1.0, 0.8 * line_h)
+            rows: dict[int, list["OCRSpan"]] = {}
+            for s in region:
+                rows.setdefault(int(round(s.y / bucket)), []).append(s)
+            lines = []
+            for row_key in sorted(rows):
+                lines.append(" ".join(s.text for s in sorted(rows[row_key], key=lambda s: s.left) if s.text.strip()))
+            segment = "\n".join(line for line in lines if line.strip())
+            if segment.strip():
+                segments.append(segment)
+    return segments
 
 
 def normalize_amount(value: str) -> Optional[float]:
@@ -5767,6 +5876,7 @@ def process_item(
         #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
         #     return
 
+        ocr_spans: Optional[list[OCRSpan]] = None
         if pdf_text is not None:
             # Embedded PDF text layer: exact characters, no OCR involved.
             q_score = 1.0
@@ -5781,10 +5891,111 @@ def process_item(
             img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
             prep_ms = perf_duration_ms(prep_started_at)
             ocr_started_at = time.perf_counter()
-            text, ocr_conf = ocr.extract(img_for_ocr)
+            ocr_spans = ocr.extract_detailed(img_for_ocr)
+            if ocr_spans is not None:
+                text = "\n".join(s.text for s in ocr_spans if s.text.strip())
+                confs = [s.conf for s in ocr_spans]
+                ocr_conf = round(max(0.0, min(1.0, (sum(confs) / len(confs)) if confs else 0.0)), 4)
+            else:
+                text, ocr_conf = ocr.extract(img_for_ocr)
             ocr_ms = perf_duration_ms(ocr_started_at)
         ocr_chars = len(text)
         is_receipt, receipt_reason = looks_like_single_receipt(text)
+
+        # One photo with SEVERAL printed receipts (deposit slips side by side):
+        # split by "COMPROVANTE DE ..." anchors and launch one row per slip.
+        if pdf_text is None and ocr_spans:
+            segments = split_receipt_segments(ocr_spans)
+            if len(segments) >= 2:
+                staged = 0
+                ingested_at = time.time()
+                for seg_idx, seg_text in enumerate(segments, 1):
+                    seg_ok, _seg_reason = looks_like_single_receipt(seg_text)
+                    if not seg_ok:
+                        continue
+                    seg_fields = parse_receipt_fields(seg_text, ocr_conf=ocr_conf, q_score=q_score)
+                    seg_bank = seg_fields.get("bank")
+                    if seg_bank is None:
+                        seg_bank = detect_bank(f"{seg_text}\n{client}", seg_fields.get("beneficiary"))
+                        seg_fields["bank"] = seg_bank
+                    # Stricter than the single path: a real slip has its own value
+                    # AND its own date; anything less is noise from the split (or
+                    # a long single receipt wrongly divided).
+                    if (
+                        seg_fields.get("amount") is None
+                        or seg_fields.get("txn_date_source") != "parsed"
+                        or not has_core_signal(seg_fields, seg_bank)
+                    ):
+                        continue
+                    seg_review = compute_review_needed(
+                        fields=seg_fields,
+                        bank=seg_bank,
+                        quality_score_value=q_score,
+                        verification_status=resolution.verification_status,
+                        min_confidence=cfg.min_confidence,
+                        resolution_source=resolution.resolution_source,
+                    )
+                    seg_payload: dict[str, Any] = {
+                        "file_id": f"{item.file_id}#p{seg_idx}",
+                        "source_path": str(resolution.original_source_path),
+                        "source_kind": resolution.original_source_kind,
+                        "ingested_at": ingested_at,
+                        "sha256": digest,
+                        "txn_date": seg_fields["txn_date"],
+                        "txn_time": seg_fields["txn_time"],
+                        "txn_date_source": seg_fields.get("txn_date_source"),
+                        "txn_time_source": seg_fields.get("txn_time_source"),
+                        "client": client,
+                        "bank": seg_bank,
+                        "beneficiary": seg_fields["beneficiary"],
+                        "amount": seg_fields["amount"],
+                        "amount_raw": seg_fields.get("amount_raw"),
+                        "amount_rounded": seg_fields.get("amount_rounded"),
+                        "amount_source": seg_fields.get("amount_source"),
+                        "currency": seg_fields["currency"],
+                        "parse_conf": seg_fields["parse_conf"],
+                        "quality_score": q_score,
+                        "ocr_engine": ocr.name,
+                        "ocr_conf": ocr_conf,
+                        "ocr_chars": len(seg_text),
+                        "review_needed": seg_review,
+                        "ocr_text": seg_text[:25000],
+                        "parser_json": json.dumps(seg_fields, ensure_ascii=False),
+                        "msg_svr_id": msg_svr_id,
+                        "talker": resolution.msg_ref.talker if resolution.msg_ref is not None else None,
+                        "msg_create_time": resolution.msg_ref.create_time if resolution.msg_ref is not None else None,
+                        "manual_session_id": item.manual_session_id,
+                        "resolved_media_path": str(path),
+                        "resolution_source": resolution.resolution_source,
+                        "verification_status": resolution.verification_status,
+                    }
+                    seg_row_payload = build_sheet_payload_from_receipt(seg_payload)
+                    seg_payload["sheet_status"] = "SINK_PENDING"
+                    seg_payload["sheet_payload_json"] = json.dumps(seg_row_payload, ensure_ascii=False)
+                    seg_payload["sheet_next_attempt"] = 0.0
+                    seg_payload["sheet_last_error"] = None
+                    seg_payload["sheet_committed_at"] = None
+                    seg_payload["excel_sheet"] = None
+                    seg_payload["excel_row"] = None
+                    db.insert_receipt(seg_payload)
+                    staged += 1
+                    print(
+                        f"[OK] {path.name}#p{seg_idx} | cliente={client} | banco={seg_bank} "
+                        f"| valor={seg_fields['amount']} | data={seg_fields['txn_date']} {seg_fields['txn_time']} "
+                        f"| sink=staged | multi_receipt={seg_idx}/{len(segments)} "
+                        f"| resolution={resolution.resolution_source} | verification={resolution.verification_status}"
+                    )
+                if staged >= 1:
+                    db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
+                    db.resolve_related_file_paths(
+                        source_path=resolution.original_source_path,
+                        exclude_file_id=item.file_id,
+                        sha256=digest,
+                    )
+                    db.resolve_message_job_paths(msg_svr_id, exclude_file_id=item.file_id, sha256=digest)
+                    db.mark_message_job_resolved(msg_svr_id, note=f"MULTI_RECEIPT_{staged}")
+                    print(f"[OK] {path.name} | multi_receipt: {staged} comprovantes lancados de {len(segments)} segmentos")
+                    return
 
         # Raw image fallback logic if text is not a receipt or amount (valor) is missing
         has_amount = False
