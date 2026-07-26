@@ -118,10 +118,16 @@ MANUAL_SESSION_FILE_HOLD_PREFIXES = (
 def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     if not path.is_file():
         return False
-    if path.suffix.lower() not in IMG_SUFFIXES:
-        return False
 
     s = str(path).lower().replace("/", "\\")
+
+    # Client receipts also arrive as PDF files; WeChat stores them flat under
+    # FileStorage\File\<YYYY-MM>\ once the file is downloaded/opened.
+    if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
+        return True
+
+    if path.suffix.lower() not in IMG_SUFFIXES:
+        return False
 
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return True
@@ -188,6 +194,8 @@ def candidate_initial_delay_seconds(source_kind: str, settle_seconds: int, thumb
 
 def detect_source_kind(path: Path) -> str:
     s = str(path).lower().replace("/", "\\")
+    if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
+        return "file_pdf"
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return "msgattach_image_dat"
     if "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
@@ -213,8 +221,19 @@ def build_lanc_headers(verification_column_name: str) -> list[str]:
 
 # Light red (#F4CCCC) used to tint rows whose value was guessed/unreadable.
 SHEET_GUESS_COLOR = {"red": 0.957, "green": 0.800, "blue": 0.800}
+# Light blue (#CFE2F3) used to tint rows that came from a PDF receipt.
+SHEET_PDF_COLOR = {"red": 0.812, "green": 0.886, "blue": 0.953}
 # White, used to clear a previous tint when a value becomes trustworthy.
 SHEET_CLEAR_COLOR = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+def sheet_row_color(row_payload: dict[str, Any]) -> dict[str, float]:
+    # Red (guessed value) always wins over the informational PDF blue.
+    if row_payload.get("value_uncertain"):
+        return SHEET_GUESS_COLOR
+    if row_payload.get("is_pdf"):
+        return SHEET_PDF_COLOR
+    return SHEET_CLEAR_COLOR
 
 
 def sheet_header_range(headers: list[str]) -> str:
@@ -313,6 +332,28 @@ def open_image_from_file(path: Path) -> tuple[Image.Image, bytes, str, Optional[
             return im.convert("RGB"), decoded, ext, key
     with Image.open(io.BytesIO(raw)) as im:
         return im.convert("RGB"), raw, path.suffix.lower().lstrip("."), None
+
+
+def load_pdf_receipt(path: Path) -> tuple[Optional[str], Optional[Image.Image], bytes]:
+    """Load a receipt PDF: return (embedded text, rendered page image, raw bytes).
+
+    Bank PDFs usually carry a text layer, which parses far better than OCR; the
+    page is only rasterized (for the normal OCR path) when the text layer is
+    missing or too small (scanned PDFs).
+    """
+    import pypdfium2 as pdfium  # lazy: only needed when PDFs actually arrive
+
+    raw = path.read_bytes()
+    doc = pdfium.PdfDocument(io.BytesIO(raw))
+    try:
+        page = doc[0]
+        text = (page.get_textpage().get_text_bounded() or "").strip()
+        if len(text) >= 40:
+            return (text, None, raw)
+        bitmap = page.render(scale=2.5)
+        return (None, bitmap.to_pil().convert("RGB"), raw)
+    finally:
+        doc.close()
 
 
 def quality_score(img: Image.Image) -> float:
@@ -968,7 +1009,14 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
 
     if has_balance_summary:
         return (False, "BALANCE_SUMMARY")
-    if has_table_header and ("total" in low or not has_strong_kw):
+    # A single TED/DOC slip legitimately contains data/hora/banco/transfer plus
+    # "TOTAL" (value + fee). An explicit single-receipt title trumps the tabular
+    # heuristic; genuine multi-transfer lists are still caught by the
+    # date/time-count rules below.
+    has_single_receipt_title = any(
+        title in compact_low for title in ("recibodeenvio", "comprovantede", "comprovantedo")
+    )
+    if has_table_header and not has_single_receipt_title and ("total" in low or not has_strong_kw):
         return (False, "TABULAR_TRANSFER_LIST")
     if has_table_header and (date_count >= 3 or time_count >= 3):
         return (False, "TABULAR_TRANSFER_LIST")
@@ -1113,6 +1161,15 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             # the transaction value, even when neighbouring lines carry strong hints.
             if any(token in line_low for token in AMOUNT_FEE_LINE_HINTS):
                 score -= 30
+            # On fee-bearing slips (TED/DOC with "TARIFA"), "TOTAL" is value+fee;
+            # the transaction value is the explicitly labeled one ("VALOR DA TED").
+            if (
+                ("total" in line_low or "total" in prev_low)
+                and "valor" not in line_low
+                and "valor" not in prev_low
+                and any(fee in full_text_low for fee in ("tarifa", "taxa"))
+            ):
+                score -= 12
             # A payment of R$ 0,00 does not exist; zero values are always fee lines
             # or OCR noise and must never win over a positive candidate.
             if re.fullmatch(r"0+(?:[.,]0+)?", raw_value):
@@ -1192,9 +1249,14 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             if value is None:
                 continue
+            before_char = line[m.start(1) - 1] if m.start(1) > 0 else ""
             after_char = line[m.end(1):m.end(1) + 1]
-            if after_char == "/":
-                continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
+            if before_char == "/" or after_char == "/":
+                continue  # part of a date ("24/07/2026,18") or document number, not an amount
+            if after_char == ":":
+                continue  # year glued to an hour ("2026,18:10:54") is date/time noise
+            if before_char == "*" or after_char == "*":
+                continue  # masked document or Pix key ("**9.762.666-**"), not an amount
             followed_by_letter = after_char.isalpha()
             if any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
                 continue  # promo/assistant banner amount (e.g. "50 para Ana") -> ignore
@@ -1372,7 +1434,13 @@ def build_sheet_payload_from_receipt(
             "value_uncertain": bool(
                 receipt_payload.get("amount") is None
                 or receipt_payload.get("amount_source") == "fallback"
+                # Glued Mercado Pago superscript cents are reconstructed by
+                # splitting digits; the split is occasionally ambiguous
+                # ("8374": 83,74 vs 837,4x), so tint for a quick human check.
+                or receipt_payload.get("amount_source") == "currency_superscript_cent_fix"
             ),
+            # Tints the row blue on the sheet so PDF receipts are recognizable.
+            "is_pdf": receipt_payload.get("source_kind") == "file_pdf",
         }
     )
     return payload
@@ -1636,7 +1704,174 @@ class WeChatDBResolver:
     def _merge_real_time_db_with_timeout(self) -> tuple[bool, str]:
         return self._merge_real_time_db_with_timeout_path(self.merge_path)
 
+    # ------------------------------------------------------------------
+    # In-process decrypt of the WeChat MSG database INCLUDING its WAL.
+    # pywxdump.all_merge_real_time_db shells out to realTime.exe, which times
+    # out on large databases and silently freezes the merge at the last WAL
+    # checkpoint (days old). WeChat pages are AES-256-CBC, 4096 bytes, IV at
+    # page[-48:-32]; WAL frames carry pages in the exact same format, so we
+    # decrypt the base file once (cached) and replay committed WAL frames.
+    # ------------------------------------------------------------------
+
+    _WAL_HEADER_SIZE = 32
+    _WAL_FRAME_HEADER_SIZE = 24
+    _PAGE_SIZE = 4096
+
+    def _derive_page_key(self, raw: bytes) -> Optional[bytes]:
+        if self._wx_key is None or len(raw) < 16:
+            return None
+        password = bytes.fromhex(self._wx_key.strip())
+        salt = raw[:16]
+        return hashlib.pbkdf2_hmac("sha1", password, salt, 64000, 32)
+
+    @staticmethod
+    def _decrypt_page(aes_key: bytes, page: bytes, skip_salt: bool) -> bytes:
+        from Cryptodome.Cipher import AES as _AES
+
+        body = page[16:] if skip_salt else page
+        iv = body[-48:-32]
+        decrypted = _AES.new(aes_key, _AES.MODE_CBC, iv).decrypt(body[:-48])
+        return decrypted + body[-48:]
+
+    def _decrypt_base_db(self, raw: bytes, aes_key: bytes) -> bytearray:
+        out = bytearray()
+        out += b"SQLite format 3\x00"
+        page = self._PAGE_SIZE
+        for i in range(0, len(raw), page):
+            chunk = raw[i:i + page]
+            if len(chunk) < page:
+                break
+            out += self._decrypt_page(aes_key, chunk, skip_salt=(i == 0))
+        return out
+
+    def _apply_wal_frames(self, out: bytearray, wal_raw: bytes, aes_key: bytes) -> int:
+        page = self._PAGE_SIZE
+        if len(wal_raw) < self._WAL_HEADER_SIZE:
+            return 0
+        wal_salt = wal_raw[16:24]
+        pos = self._WAL_HEADER_SIZE
+        pending: list[tuple[int, bytes]] = []
+        latest: dict[int, bytes] = {}
+        while pos + self._WAL_FRAME_HEADER_SIZE + page <= len(wal_raw):
+            header = wal_raw[pos:pos + self._WAL_FRAME_HEADER_SIZE]
+            frame_page = wal_raw[pos + self._WAL_FRAME_HEADER_SIZE:pos + self._WAL_FRAME_HEADER_SIZE + page]
+            pos += self._WAL_FRAME_HEADER_SIZE + page
+            if header[8:16] != wal_salt:
+                # Frame from a previous WAL generation (left over after a
+                # checkpoint restart) -- not part of the current log.
+                continue
+            pgno = int.from_bytes(header[0:4], "big")
+            commit_size = int.from_bytes(header[4:8], "big")
+            if pgno <= 0:
+                continue
+            pending.append((pgno, frame_page))
+            if commit_size:
+                for p, data in pending:
+                    latest[p] = data
+                pending = []
+        applied = 0
+        for pgno, data in latest.items():
+            decrypted = self._decrypt_page(aes_key, data, skip_salt=(pgno == 1))
+            if pgno == 1:
+                decrypted = b"SQLite format 3\x00" + decrypted
+            offset = (pgno - 1) * page
+            if len(out) < offset + page:
+                out.extend(b"\x00" * (offset + page - len(out)))
+            out[offset:offset + page] = decrypted
+            applied += 1
+        return applied
+
+    def _decrypt_db_with_wal(self, src_db: Path, out_db: Path) -> tuple[bool, str]:
+        try:
+            raw = src_db.read_bytes()
+        except Exception as exc:
+            return False, f"read_failed:{type(exc).__name__}:{exc}"
+        if len(raw) < self._PAGE_SIZE:
+            return False, "db_too_small"
+        aes_key = self._derive_page_key(raw)
+        if aes_key is None:
+            return False, "no_key"
+
+        # Cache the decrypted base: it only changes when WeChat checkpoints.
+        cache_path = out_db.parent / f"base_{src_db.stem.lower()}.cache.db"
+        meta_path = cache_path.with_suffix(".meta")
+        try:
+            stat = src_db.stat()
+            meta_now = f"{stat.st_size}|{stat.st_mtime_ns}"
+        except Exception as exc:
+            return False, f"stat_failed:{type(exc).__name__}:{exc}"
+        base: Optional[bytearray] = None
+        try:
+            if cache_path.exists() and meta_path.exists() and meta_path.read_text(encoding="utf-8") == meta_now:
+                base = bytearray(cache_path.read_bytes())
+        except Exception:
+            base = None
+        if base is None:
+            base = self._decrypt_base_db(raw, aes_key)
+            try:
+                cache_path.write_bytes(base)
+                meta_path.write_text(meta_now, encoding="utf-8")
+            except Exception:
+                pass
+
+        wal_path = src_db.with_name(src_db.name + "-wal")
+        applied = 0
+        if wal_path.exists():
+            try:
+                wal_raw = wal_path.read_bytes()
+                applied = self._apply_wal_frames(base, wal_raw, aes_key)
+            except Exception as exc:
+                return False, f"wal_apply_failed:{type(exc).__name__}:{exc}"
+        try:
+            out_db.write_bytes(base)
+        except Exception as exc:
+            return False, f"write_failed:{type(exc).__name__}:{exc}"
+        return True, f"ok:wal_pages={applied}"
+
     def _merge_real_time_db_with_timeout_path(self, target_path: Path) -> tuple[bool, str]:
+        assert self._wx_dir is not None
+        multi_dir = self._wx_dir / "Msg" / "Multi"
+        shards = sorted(multi_dir.glob("MSG*.db"), key=lambda p: p.name)
+        shards = [p for p in shards if re.fullmatch(r"msg\d+\.db", p.name.lower())]
+        if not shards:
+            return False, f"no_msg_shards_in:{multi_dir}"
+
+        decrypted: list[Path] = []
+        for shard in shards:
+            out = target_path.parent / f"de_{shard.stem.lower()}.db"
+            code, detail = self._decrypt_db_with_wal(shard, out)
+            if not code:
+                return False, f"{shard.name}:{detail}"
+            decrypted.append(out)
+
+        if len(decrypted) == 1:
+            try:
+                if target_path.exists():
+                    target_path.unlink()
+                decrypted[0].replace(target_path)
+            except Exception as exc:
+                return False, f"finalize_failed:{type(exc).__name__}:{exc}"
+            return True, "ok:single_shard"
+
+        # Multiple shards: copy the first, append the MSG rows of the rest.
+        try:
+            if target_path.exists():
+                target_path.unlink()
+            decrypted[0].replace(target_path)
+            conn = sqlite3.connect(str(target_path))
+            try:
+                for extra in decrypted[1:]:
+                    conn.execute("ATTACH DATABASE ? AS extra", (str(extra),))
+                    conn.execute("INSERT OR IGNORE INTO MSG SELECT * FROM extra.MSG")
+                    conn.commit()
+                    conn.execute("DETACH DATABASE extra")
+            finally:
+                conn.close()
+        except Exception as exc:
+            return False, f"multi_merge_failed:{type(exc).__name__}:{exc}"
+        return True, f"ok:{len(decrypted)}_shards"
+
+    def _merge_real_time_db_with_timeout_path_legacy(self, target_path: Path) -> tuple[bool, str]:
         assert self._wx_key is not None
         assert self._wx_dir is not None
 
@@ -1718,12 +1953,17 @@ class WeChatDBResolver:
                         if self.merge_path.exists():
                             self.merge_path.unlink()
                         tmp_merge_path.rename(self.merge_path)
+                        if self._last_error is not None:
+                            print(f"[RESOLVER] merge recuperado ({ret})")
                         self._last_refresh = time.time()
                         self._last_failure = 0.0
                         self._last_error = None
                     except Exception as exc:
                         self._mark_refresh_failure(time.time(), f"rename_failed:{type(exc).__name__}:{exc}")
                 else:
+                    # A failed merge silently degrades every downstream feature
+                    # (client attribution, msg dedup, ordering) -- make it visible.
+                    print(f"[RESOLVER] merge_failed: {str(ret)[:200]}")
                     self._mark_refresh_failure(time.time(), f"merge_failed:{ret}")
                     try:
                         if tmp_merge_path.exists():
@@ -1877,6 +2117,88 @@ class WeChatDBResolver:
                 msg_paths.add(path_to_normalized_windows(msg.image_abs_path))
             if msg.thumb_abs_path is not None:
                 msg_paths.add(path_to_normalized_windows(msg.thumb_abs_path))
+            if path_norms & msg_paths:
+                return msg
+        return None
+
+    def _extract_attached_file_path(self, bytes_extra: Any) -> Optional[str]:
+        try:
+            decoded = self._decode_bytes_extra(bytes_extra) if self._decode_bytes_extra else {}
+        except Exception:
+            decoded = {}
+        items = decoded.get("3") if isinstance(decoded, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("2") or "").strip()
+                if "\\filestorage\\file\\" in value.lower().replace("/", "\\"):
+                    return value
+        raw_text = str(decoded)
+        match = re.search(r"(wxid_[^\\']+\\FileStorage\\File\\[^']+?\.(?:pdf|PDF))", raw_text)
+        return match.group(1) if match else None
+
+    def _recent_file_messages(
+        self,
+        pivot_ts: float,
+        lookback_sec: int,
+        lookahead_sec: int,
+        limit: int = 120,
+    ) -> list[WeChatMessageRef]:
+        if not self.refresh_if_due():
+            return []
+        if not self.merge_path.exists():
+            return []
+        lower = max(0, int(pivot_ts) - max(5, int(lookback_sec)))
+        upper = int(pivot_ts) + max(1, int(lookahead_sec))
+        conn = sqlite3.connect(str(self.merge_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                FROM MSG
+                WHERE Type=49
+                  AND CreateTime BETWEEN ? AND ?
+                ORDER BY ABS(CreateTime - ?) ASC, CreateTime DESC
+                LIMIT ?
+                """,
+                (lower, upper, int(pivot_ts), int(max(1, limit))),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        out: list[WeChatMessageRef] = []
+        for row in rows:
+            file_rel = self._extract_attached_file_path(row["BytesExtra"])
+            if not file_rel:
+                continue
+            out.append(
+                WeChatMessageRef(
+                    msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
+                    talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
+                    create_time=float(row["CreateTime"]),
+                    sender_user_name=None,
+                    sender_display=None,
+                    image_rel_path=file_rel,
+                    thumb_rel_path=None,
+                    image_abs_path=self._absolute_path_from_rel(file_rel),
+                    thumb_abs_path=None,
+                )
+            )
+        return out
+
+    def find_file_message_for_path(self, path: Path, pivot_ts: float) -> Optional[WeChatMessageRef]:
+        """Match an attachment file (e.g. a receipt PDF) to its Type=49 message.
+
+        Users download a PDF minutes after the message arrives (file mtime =
+        download time), so the lookback is much wider than for auto-saved images.
+        """
+        path_norms = self._candidate_norms(path)
+        for msg in self._recent_file_messages(pivot_ts, lookback_sec=6 * 3600, lookahead_sec=120, limit=200):
+            msg_paths = {normalize_windows_text(msg.image_rel_path)} if msg.image_rel_path else set()
+            if msg.image_abs_path is not None:
+                msg_paths.add(path_to_normalized_windows(msg.image_abs_path))
             if path_norms & msg_paths:
                 return msg
         return None
@@ -4489,12 +4811,11 @@ class GoogleSheetsSink(RowSink):
             return self.review_worksheet
         return main_title
 
-    def _apply_row_highlight(self, worksheet: Any, row_idx: int, uncertain: bool) -> None:
-        # Tint the whole row light red when the value was guessed/unreadable, or
-        # clear it back to white when the value is trustworthy. Never let a
-        # formatting hiccup break ingestion.
+    def _apply_row_highlight(self, worksheet: Any, row_idx: int, color: dict[str, float]) -> None:
+        # Tint the whole row: red = guessed/unreadable value, blue = PDF receipt,
+        # white = trustworthy image read. Never let a formatting hiccup break
+        # ingestion.
         row_value = max(2, int(row_idx))
-        color = SHEET_GUESS_COLOR if uncertain else SHEET_CLEAR_COLOR
         try:
             worksheet.format(
                 sheet_row_range(self.headers, row_value),
@@ -4514,7 +4835,7 @@ class GoogleSheetsSink(RowSink):
                 table_range=sheet_table_range(self.headers),
             )
             row_idx = len(worksheet.col_values(1))
-            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
+            self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
             return title, row_idx
 
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
@@ -4529,7 +4850,7 @@ class GoogleSheetsSink(RowSink):
                 values=[build_sink_row_values(row_payload)],
                 value_input_option="USER_ENTERED",
             )
-            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
+            self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -5057,6 +5378,32 @@ def resolve_media_candidate(
     manual_session_started_at = db.get_manual_session_started_at() if manual_materialization_mode else None
     manual_session_id = item.manual_session_id
 
+    if original_source_kind == "file_pdf":
+        # A downloaded PDF is already the full document; the only work is to
+        # attribute it to a group via its Type=49 message in the WeChat DB.
+        runtime_resolver = runtime_media_resolver(media_resolver)
+        msg_ref = (
+            runtime_resolver.find_file_message_for_path(original_path, item.mtime)
+            if runtime_resolver is not None
+            else None
+        )
+        client_source_path = original_path
+        if msg_ref is not None and msg_ref.talker:
+            group_hash = hashlib.md5(str(msg_ref.talker).encode("utf-8")).hexdigest()
+            # Synthetic MsgAttach-style path so the existing group-id extraction
+            # and client map lookup work unchanged for PDFs.
+            client_source_path = original_path.parent / "MsgAttach" / group_hash / original_path.name
+        return MediaResolution(
+            original_source_path=original_path,
+            original_source_kind=original_source_kind,
+            resolved_path=original_path,
+            resolved_source_kind="file_pdf",
+            client_source_path=client_source_path,
+            resolution_source="file_pdf",
+            verification_status="CONFIRMADO",
+            msg_ref=msg_ref,
+        )
+
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
             item.mtime,
@@ -5389,7 +5736,11 @@ def process_item(
                 or gid == "9e20f478899dc29eb19741386f9343c8"
             )
             is_manual_open = (item.source_kind == "temp_image" or bool(item.manual_session_id))
-            if is_file_transfer or is_manual_open:
+            # A PDF whose message correlation has not resolved after a few held
+            # attempts (~10 min) still gets launched, with client "-", instead of
+            # waiting forever.
+            is_pdf_after_grace = (item.source_kind == "file_pdf" and item.attempts >= 5)
+            if is_file_transfer or is_manual_open or is_pdf_after_grace:
                 client = "-"
                 print(f"[INFO] {path.name} | grupo_sem_mapa={gid} mas prosseguindo (abertura manual/file_transfer)")
             else:
@@ -5398,7 +5749,14 @@ def process_item(
                 return
 
         open_started_at = time.perf_counter()
-        img, img_bytes, _ext, _key = open_image_from_file(path)
+        pdf_text: Optional[str] = None
+        if resolution.resolved_source_kind == "file_pdf":
+            pdf_text, pdf_img, img_bytes = load_pdf_receipt(path)
+            # With a text layer there is nothing to OCR; the placeholder image is
+            # never rendered anywhere.
+            img = pdf_img if pdf_img is not None else Image.new("RGB", (8, 8), "white")
+        else:
+            img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
 
@@ -5409,14 +5767,22 @@ def process_item(
         #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
         #     return
 
-        q_score = quality_score(img)
+        if pdf_text is not None:
+            # Embedded PDF text layer: exact characters, no OCR involved.
+            q_score = 1.0
+            img_for_ocr = img
+            prep_ms = 0.0
+            text, ocr_conf = pdf_text, 1.0
+            ocr_ms = 0.0
+        else:
+            q_score = quality_score(img)
 
-        prep_started_at = time.perf_counter()
-        img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
-        prep_ms = perf_duration_ms(prep_started_at)
-        ocr_started_at = time.perf_counter()
-        text, ocr_conf = ocr.extract(img_for_ocr)
-        ocr_ms = perf_duration_ms(ocr_started_at)
+            prep_started_at = time.perf_counter()
+            img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
+            prep_ms = perf_duration_ms(prep_started_at)
+            ocr_started_at = time.perf_counter()
+            text, ocr_conf = ocr.extract(img_for_ocr)
+            ocr_ms = perf_duration_ms(ocr_started_at)
         ocr_chars = len(text)
         is_receipt, receipt_reason = looks_like_single_receipt(text)
 
@@ -5512,7 +5878,7 @@ def process_item(
             "currency": fields["currency"],
             "parse_conf": fields["parse_conf"],
             "quality_score": q_score,
-            "ocr_engine": ocr.name,
+            "ocr_engine": "pdf_text" if pdf_text is not None else ocr.name,
             "ocr_conf": ocr_conf,
             "ocr_chars": ocr_chars,
             "review_needed": review_needed,

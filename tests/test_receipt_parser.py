@@ -20,6 +20,7 @@ from wechat_receipt_daemon import (
     candidate_initial_delay_seconds,
     hold_retry_delay_seconds,
     is_candidate,
+    looks_like_single_receipt,
     normalize_amount,
     normalize_client_label,
     parse_receipt_fields,
@@ -158,9 +159,12 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertEqual(fields["amount_rounded"], 668.0)
         self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
 
-    def test_mercado_pago_superscript_cent_reads_three_digit_value(self) -> None:
+    def test_mercado_pago_superscript_cent_splits_two_cent_digits(self) -> None:
         # Real OCR text: MP renders cents as small superscript digits that OCR glues
-        # onto the value ("R$ 837" + superscript 4 -> "R$ 8374"). Value is 837,4.
+        # onto the value. Cents are always TWO digits on Brazilian receipts, so a
+        # glued no-separator token splits its last two digits ("R$ 8374" -> 83,74).
+        # Confirmed by real receipts of 23-24/07/2026: "6737" was R$ 67,37 and
+        # "3720" was R$ 37,20 (the old one-digit split launched 673,7/372,0).
         text = "\n".join(
             [
                 "mercado",
@@ -177,9 +181,121 @@ class ParseReceiptFieldsTests(unittest.TestCase):
 
         fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
 
-        self.assertEqual(fields["amount"], 837.4)
-        self.assertEqual(fields["amount_rounded"], 837.0)
+        self.assertEqual(fields["amount"], 83.74)
+        self.assertEqual(fields["amount_rounded"], 84.0)
         self.assertEqual(fields["amount_source"], "currency_superscript_cent_fix")
+
+    def test_mp_thousands_with_glued_superscript_cent_digit(self) -> None:
+        # Real receipt 24/07/2026 16:40: R$ 1.741,xx OCR'd as "R$ 1.7419".
+        # Old behavior parsed the thousands dot as decimal and launched 1,74.
+        text = "\n".join(
+            [
+                "mercado",
+                "pago",
+                "Comprovante de Pix",
+                "24/julho/2026as16:40:05.",
+                "R$ 1.7419",
+                "Origemedestino",
+                "DEIVIDWILLIANSOUZARAMOS",
+                "Amd RepresentacoeseServicosLtda",
+                "BANCODOBRASILS.A.",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 1741.09)
+        self.assertEqual(fields["amount_rounded"], 1741.0)
+
+    def test_currency_with_ocr_dot_instead_of_decimal_comma(self) -> None:
+        # Real receipt 24/07/2026 13:09 (Santander): "R$26.129,00" OCR'd as
+        # "R$26.129.00". Old behavior failed to parse and launched an empty value.
+        text = "\n".join(
+            [
+                "Santander",
+                "Comprovantedopagamento",
+                "24/07/2026-13:09:29",
+                "Valordopagamento",
+                "R$26.129.00",
+                "Tipo detransferencia",
+                "Pix",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 26129.0)
+
+    def test_masked_pix_key_never_wins_over_real_value(self) -> None:
+        # Real receipt 24/07/2026 14:59 (REUNIBANK): value "R$1.695.00" plus a
+        # masked Pix key "**9.762.666-**". Old behavior launched 9.762.666,00.
+        text = "\n".join(
+            [
+                "REUNIBANK",
+                "ComprovantedeTransferencia",
+                "DadosdaTransacao",
+                "ID da transacao:1766",
+                "Valortotal:R$1.695.00",
+                "Status: Sucesso",
+                "Data:24/07/2026",
+                "Horario:14:59",
+                "Nome:CLEENDINTERMEDIACAOEATACADOLTDA",
+                "Chave pix:**9.762.666-**",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 1695.0)
+
+    def test_year_glued_to_hour_never_beats_currency_value(self) -> None:
+        # Real receipt 24/07/2026 18:10 (Caixa app): date line "24/07/2026,18:10:54"
+        # produced fallback candidate "2026,18" that outranked "R$933,00" because
+        # "Pix enviado" sat right above the date line. Old behavior launched 2026,18.
+        text = "\n".join(
+            [
+                "Pix enviado",
+                "24/07/2026,18:10:54",
+                "R$933,00",
+                "Valor",
+                "Recebedor",
+                "Cleend Eletronicos",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 933.0)
+
+    def test_caixa_ted_slip_is_a_receipt_and_uses_valor_not_total(self) -> None:
+        # Real receipt 24/07/2026 15:19 (Caixa printed TED slip): was discarded as
+        # TABULAR_TRANSFER_LIST (has data/hora/banco/transfer + TOTAL); and TOTAL
+        # (value+fee) must not beat VALOR DA TED.
+        text = "\n".join(
+            [
+                "CAIXA ECONOMICA FEDERAL",
+                "DATA: 24/07/2026 HORA: 15:19:16",
+                "TERMINAL:1102 NSU:000339",
+                "RECIBO DE ENVIO DE TED - AGENCIA 3053",
+                "REMETENTE:",
+                "BANCO: CAIXA ECONOMICA FEDERAL AG: 3053-8",
+                "NOME: WILBERT JORGE CCOYO",
+                "DESTINATARIO:",
+                "BCO DO BRASIL S.A.",
+                "NOME: AMD REPRESENTACOES E SERVICOS LTDA",
+                "VALOR DA TED : 10.000,00",
+                "TARIFA SERVICO : 25,00",
+                "TOTAL : 10.025,00",
+                "AUTENTICACAO",
+                "CEF30532407260003701000339 10.025,00RD1102",
+                "DEBITO REALIZADO COM SUCESSO. A PREVISAO DE",
+                "CREDITO NA CONTA DE DESTINO E DE 60 MINUTOS.",
+            ]
+        )
+        is_receipt, reason = looks_like_single_receipt(text)
+        self.assertTrue(is_receipt, reason)
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 10000.0)
+
+    def test_pdf_under_filestorage_file_is_candidate_and_detected(self) -> None:
+        from wechat_receipt_daemon import detect_source_kind
+
+        pdf = Path(r"C:\Users\x\Documents\WeChat Files\wxid_a\FileStorage\File\2026-07\comprovante.pdf")
+        self.assertEqual(detect_source_kind(pdf), "file_pdf")
+        xlsx = Path(r"C:\Users\x\Documents\WeChat Files\wxid_a\FileStorage\File\2026-07\planilha.xlsx")
+        self.assertEqual(detect_source_kind(xlsx), "other")
 
     def test_non_mercado_pago_compact_cent_fix_still_splits_two_digits(self) -> None:
         text = "\n".join(
