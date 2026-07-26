@@ -1,0 +1,35 @@
+TOTAL: 15481
+IDENTICOS: 15299 (98.82%)
+MELHOROU (lixo -> valor plausivel): 106
+Regra MP sobrescrito (era 10x maior, agora /10 + vermelho): 46
+Casos restantes: 30
+  [OLHAR] cliente=168 | ontem=10.0 -> hoje=30000.0 | 12/06/2026 14:17
+  [VIROU-VAZIO] cliente=6 | ontem=911.6 -> hoje=None | 17/06/2026 00:01
+  [OLHAR] cliente=65 | ontem=10.0 -> hoje=6000.0 | 17/06/2026 -
+  [OLHAR] cliente=1 | ontem=8.34 -> hoje=2447.0 | 17/06/2026 14:04
+  [OLHAR] cliente=- | ontem=139.5 -> hoje=17.06 | 18/06/2026 17:32
+  [OLHAR] cliente=1 | ontem=2000.0 -> hoje=2028.08 | 22/06/2026 17:37
+  [OLHAR] cliente=1 | ontem=1900.0 -> hoje=2000.0 | 22/06/2026 17:40
+  [OLHAR] cliente=1 | ontem=33055.0 -> hoje=2000.0 | 22/06/2026 -
+  [OLHAR] cliente=65 | ontem=2026.1 -> hoje=3.0 | 12/06/2026 22:51
+  [OLHAR] cliente=652 | ontem=9.53 -> hoje=497975.0 | 25/06/2026 17:16
+  [VIROU-VAZIO] cliente=66 | ontem=57504.0 -> hoje=None | 01/07/2026 -
+  [OLHAR] cliente=- | ontem=13.05 -> hoje=1386.0 | 03/07/2026 15:27
+  [OLHAR] cliente=168 | ontem=349524.0 -> hoje=4000.0 | 03/07/2026 09:47
+  [OLHAR] cliente=168 | ontem=6031.45 -> hoje=6035.45 | 03/07/2026 -
+  [OLHAR] cliente=69 | ontem=1767.0 -> hoje=1767.15 | 19/05/2026 16:06
+  [OLHAR] cliente=65 | ontem=20250550.39 -> hoje=None | 04/07/2025 -
+  [OLHAR] cliente=16 | ontem=1200.0 -> hoje=2843.56 | 10/07/2026 -
+  [OLHAR] cliente=6 | ontem=13.2 -> hoje=11.7 | 11/02/2020 12:21
+  [OLHAR] cliente=1 | ontem=11.4 -> hoje=15.11 | 15/07/2026 17:11
+  [OLHAR] cliente=116A | ontem=3300.0 -> hoje=2955.0 | 16/07/2026 00:30
+  [OLHAR] cliente=1 | ontem=8.5 -> hoje=4000.0 | 17/07/2026 11:44
+  [OLHAR] cliente=116A | ontem=186.5 -> hoje=3140.0 | 20/07/2026 09:41
+  [OLHAR] cliente=1 | ontem=4197.7 -> hoje=2850.0 | 21/07/2026 11:54
+  [OLHAR] cliente=1 | ontem=19691.0 -> hoje=30000.0 | 21/07/2026 12:01
+  [OLHAR] cliente=66 | ontem=40805.0 -> hoje=724613220034.52 | 22/07/2026 14:33
+  [VIROU-VAZIO] cliente=65 | ontem=134276.0 -> hoje=None | 22/07/2026 -
+  [OLHAR] cliente=16 | ontem=55.56 -> hoje=4000.0 | 22/07/2026 08:55
+  [OLHAR] cliente=1 | ontem=692358.0 -> hoje=None | 23/07/2026 -
+  [OLHAR] cliente=991 | ontem=575.7 -> hoje=3849.0 | 24/07/2026 11:11
+  [OLHAR] cliente=168 | ontem=6.31 -> hoje=6314.02 | 24/07/2026 17:00

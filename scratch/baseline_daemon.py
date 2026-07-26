@@ -118,16 +118,10 @@ MANUAL_SESSION_FILE_HOLD_PREFIXES = (
 def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     if not path.is_file():
         return False
-
-    s = str(path).lower().replace("/", "\\")
-
-    # Client receipts also arrive as PDF files; WeChat stores them flat under
-    # FileStorage\File\<YYYY-MM>\ once the file is downloaded/opened.
-    if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
-        return True
-
     if path.suffix.lower() not in IMG_SUFFIXES:
         return False
+
+    s = str(path).lower().replace("/", "\\")
 
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return True
@@ -194,8 +188,6 @@ def candidate_initial_delay_seconds(source_kind: str, settle_seconds: int, thumb
 
 def detect_source_kind(path: Path) -> str:
     s = str(path).lower().replace("/", "\\")
-    if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
-        return "file_pdf"
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return "msgattach_image_dat"
     if "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
@@ -221,19 +213,8 @@ def build_lanc_headers(verification_column_name: str) -> list[str]:
 
 # Light red (#F4CCCC) used to tint rows whose value was guessed/unreadable.
 SHEET_GUESS_COLOR = {"red": 0.957, "green": 0.800, "blue": 0.800}
-# Light blue (#CFE2F3) used to tint rows that came from a PDF receipt.
-SHEET_PDF_COLOR = {"red": 0.812, "green": 0.886, "blue": 0.953}
 # White, used to clear a previous tint when a value becomes trustworthy.
 SHEET_CLEAR_COLOR = {"red": 1.0, "green": 1.0, "blue": 1.0}
-
-
-def sheet_row_color(row_payload: dict[str, Any]) -> dict[str, float]:
-    # Red (guessed value) always wins over the informational PDF blue.
-    if row_payload.get("value_uncertain"):
-        return SHEET_GUESS_COLOR
-    if row_payload.get("is_pdf"):
-        return SHEET_PDF_COLOR
-    return SHEET_CLEAR_COLOR
 
 
 def sheet_header_range(headers: list[str]) -> str:
@@ -334,28 +315,6 @@ def open_image_from_file(path: Path) -> tuple[Image.Image, bytes, str, Optional[
         return im.convert("RGB"), raw, path.suffix.lower().lstrip("."), None
 
 
-def load_pdf_receipt(path: Path) -> tuple[Optional[str], Optional[Image.Image], bytes]:
-    """Load a receipt PDF: return (embedded text, rendered page image, raw bytes).
-
-    Bank PDFs usually carry a text layer, which parses far better than OCR; the
-    page is only rasterized (for the normal OCR path) when the text layer is
-    missing or too small (scanned PDFs).
-    """
-    import pypdfium2 as pdfium  # lazy: only needed when PDFs actually arrive
-
-    raw = path.read_bytes()
-    doc = pdfium.PdfDocument(io.BytesIO(raw))
-    try:
-        page = doc[0]
-        text = (page.get_textpage().get_text_bounded() or "").strip()
-        if len(text) >= 40:
-            return (text, None, raw)
-        bitmap = page.render(scale=2.5)
-        return (None, bitmap.to_pil().convert("RGB"), raw)
-    finally:
-        doc.close()
-
-
 def quality_score(img: Image.Image) -> float:
     w, h = img.size
     gray = img.convert("L")
@@ -369,33 +328,11 @@ def quality_score(img: Image.Image) -> float:
     return round(max(0.0, min(1.0, score)), 4)
 
 
-@dataclass(frozen=True)
-class OCRSpan:
-    left: float
-    top: float
-    right: float
-    bottom: float
-    text: str
-    conf: float
-
-    @property
-    def x(self) -> float:
-        return (self.left + self.right) / 2.0
-
-    @property
-    def y(self) -> float:
-        return (self.top + self.bottom) / 2.0
-
-
 class OCREngine:
     name = "none"
 
     def extract(self, img: Image.Image) -> tuple[str, float]:
         raise NotImplementedError
-
-    def extract_detailed(self, img: Image.Image) -> Optional[list[OCRSpan]]:
-        # Engines without box output return None; callers fall back to extract().
-        return None
 
 
 class RapidOCREngine(OCREngine):
@@ -407,43 +344,24 @@ class RapidOCREngine(OCREngine):
         self._ocr = RapidOCR()
 
     def extract(self, img: Image.Image) -> tuple[str, float]:
-        spans = self.extract_detailed(img)
-        if not spans:
-            return "", 0.0
-        text = "\n".join(s.text for s in spans if s.text.strip())
-        confs = [s.conf for s in spans]
-        conf = (sum(confs) / len(confs)) if confs else 0.5
-        return text, round(max(0.0, min(1.0, conf)), 4)
-
-    def extract_detailed(self, img: Image.Image) -> Optional[list[OCRSpan]]:
         import numpy as np  # type: ignore
 
         arr = np.array(img.convert("RGB"))
         result, _ = self._ocr(arr)
         if not result:
-            return []
-        spans: list[OCRSpan] = []
+            return "", 0.0
+        texts: list[str] = []
+        confs: list[float] = []
         for item in result:
-            if len(item) < 3:
-                continue
-            try:
-                box = item[0]
-                xs = [float(p[0]) for p in box]
-                ys = [float(p[1]) for p in box]
-                conf = float(item[2])
-            except Exception:
-                continue
-            spans.append(
-                OCRSpan(
-                    left=min(xs),
-                    top=min(ys),
-                    right=max(xs),
-                    bottom=max(ys),
-                    text=str(item[1]),
-                    conf=conf,
-                )
-            )
-        return spans
+            if len(item) >= 3:
+                texts.append(str(item[1]))
+                try:
+                    confs.append(float(item[2]))
+                except Exception:
+                    pass
+        text = "\n".join(t for t in texts if t.strip())
+        conf = (sum(confs) / len(confs)) if confs else 0.5
+        return text, round(max(0.0, min(1.0, conf)), 4)
 
 
 class TesseractOCREngine(OCREngine):
@@ -556,32 +474,6 @@ AMOUNT_NEGATIVE_HINTS = (
 # Marcadores do bloco de propaganda/assistente. Quando um valor esta colado a uma
 # palavra (ex.: "50para Ana") E o contexto tem um desses marcadores, ele e
 # descartado de vez -- e sugestao do app, nunca o valor do comprovante.
-def has_promo_marker(context_low: str) -> bool:
-    """True when the context looks like the promo/assistant banner.
-
-    Two failure modes must coexist:
-    - "audio" lives inside payer names ("Claudio", "RECAUDIOVISUAL"); a single
-      embedded marker must NOT discard a real receipt.
-    - OCR often glues the banner words ("mensagemouaudio", "Baixeoappeconheca"),
-      so requiring standalone words alone would let the banner value through.
-    The banner always carries SEVERAL markers together, names carry exactly one:
-    two or more distinct markers (even glued) = banner; a single marker only
-    counts when it appears as a standalone word.
-    """
-    hits = {marker for marker in AMOUNT_PROMO_MARKERS if marker in context_low}
-    if not hits:
-        return False
-    if len(hits) >= 2:
-        return True
-    marker = next(iter(hits))
-    for m in re.finditer(re.escape(marker), context_low):
-        before = context_low[m.start() - 1:m.start()]
-        after = context_low[m.end():m.end() + 1]
-        if not before.isalpha() and not after.isalpha():
-            return True
-    return False
-
-
 AMOUNT_PROMO_MARKERS = (
     "assistente",
     "baixe",
@@ -720,7 +612,6 @@ CLIENT_LABEL_SPECIAL_CASES = {
     "PP": "6",
 }
 IGNORED_SENDER_USERNAMES = {
-    "filehelper",  # "File Transfer" self-chat: user sends files to themselves, never client receipts
     "wxid_wml3ftd6qpea12",
     "wxid_jhb1tt23of8422",
     "wxid_5sd4qzz1lyhl12",
@@ -1076,14 +967,7 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
 
     if has_balance_summary:
         return (False, "BALANCE_SUMMARY")
-    # A single TED/DOC slip legitimately contains data/hora/banco/transfer plus
-    # "TOTAL" (value + fee). An explicit single-receipt title trumps the tabular
-    # heuristic; genuine multi-transfer lists are still caught by the
-    # date/time-count rules below.
-    has_single_receipt_title = any(
-        title in compact_low for title in ("recibodeenvio", "comprovantede", "comprovantedo")
-    )
-    if has_table_header and not has_single_receipt_title and ("total" in low or not has_strong_kw):
+    if has_table_header and ("total" in low or not has_strong_kw):
         return (False, "TABULAR_TRANSFER_LIST")
     if has_table_header and (date_count >= 3 or time_count >= 3):
         return (False, "TABULAR_TRANSFER_LIST")
@@ -1095,92 +979,6 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
     return (True, "OK")
 
 
-# Pix end-to-end id: "E" + 31 alphanumeric chars (ISPB + date + sequence).
-PIX_E2E_ID_PATTERN = re.compile(r"E[0-9A-Za-z]{31}")
-
-
-def extract_pix_transaction_ids(text: str) -> set[str]:
-    # OCR often splits the id across lines; compact everything first.
-    compact = re.sub(r"[^0-9A-Za-z]", "", text or "")
-    return {m.group(0).upper() for m in PIX_E2E_ID_PATTERN.finditer(compact)}
-
-
-def looks_like_sender_continuation(text: str) -> bool:
-    """A screenshot of the BOTTOM of a receipt (sender details, no value)."""
-    low = strip_accents(str(text or "").lower())
-    if "valor" in low:
-        return False
-    return any(token in low for token in ("origem", "pagador", "remetente"))
-
-
-def _receipt_anchor_norm(text: str) -> str:
-    return re.sub(r"[^a-z]", "", strip_accents(str(text or "").lower()))
-
-
-def split_receipt_segments(spans: list["OCRSpan"]) -> list[str]:
-    """Split one photo containing SEVERAL receipts into per-receipt texts.
-
-    Clients photograph 2-6 printed slips side by side; reading the OCR output
-    top-to-bottom interleaves the columns. Each slip carries a
-    "COMPROVANTE DE ..." header, so those anchors define columns (by x) and
-    receipt regions within a column (by y). Returns [] unless at least two
-    anchors are found.
-    """
-    if not spans:
-        return []
-    anchors = [s for s in spans if "comprovantede" in _receipt_anchor_norm(s.text)]
-    if len(anchors) < 2:
-        return []
-
-    heights = sorted((s.bottom - s.top) for s in spans if s.bottom > s.top)
-    line_h = heights[len(heights) // 2] if heights else 12.0
-    total_left = min(s.left for s in spans)
-    total_right = max(s.right for s in spans)
-    total_width = max(1.0, total_right - total_left)
-
-    # Columns: cluster anchor x-centers; a gap larger than a third of the image
-    # width means a new column of slips.
-    columns: list[list["OCRSpan"]] = []
-    for anchor in sorted(anchors, key=lambda s: s.x):
-        if columns and (anchor.x - columns[-1][-1].x) <= 0.33 * total_width:
-            columns[-1].append(anchor)
-        else:
-            columns.append([anchor])
-
-    col_centers = [sum(a.x for a in col) / len(col) for col in columns]
-
-    def _column_of(span: "OCRSpan") -> int:
-        return min(range(len(col_centers)), key=lambda i: abs(span.x - col_centers[i]))
-
-    spans_by_column: dict[int, list["OCRSpan"]] = {}
-    for s in spans:
-        spans_by_column.setdefault(_column_of(s), []).append(s)
-
-    segments: list[str] = []
-    for col_idx, col_anchors in enumerate(columns):
-        col_spans = spans_by_column.get(col_idx, [])
-        ordered_anchors = sorted(col_anchors, key=lambda s: s.y)
-        for idx, anchor in enumerate(ordered_anchors):
-            # The date/bank line sits a couple of lines ABOVE the header.
-            start_y = anchor.y - 3.0 * line_h
-            end_y = ordered_anchors[idx + 1].y - 3.0 * line_h if idx + 1 < len(ordered_anchors) else float("inf")
-            region = [s for s in col_spans if start_y <= s.y < end_y]
-            if len(region) < 4:
-                continue
-            # Rebuild reading order: bucket spans into visual rows, join by x.
-            bucket = max(1.0, 0.8 * line_h)
-            rows: dict[int, list["OCRSpan"]] = {}
-            for s in region:
-                rows.setdefault(int(round(s.y / bucket)), []).append(s)
-            lines = []
-            for row_key in sorted(rows):
-                lines.append(" ".join(s.text for s in sorted(rows[row_key], key=lambda s: s.left) if s.text.strip()))
-            segment = "\n".join(line for line in lines if line.strip())
-            if segment.strip():
-                segments.append(segment)
-    return segments
-
-
 def normalize_amount(value: str) -> Optional[float]:
     s = re.sub(r"[^\d,\.]", "", value.strip())
     if not s:
@@ -1190,29 +988,8 @@ def normalize_amount(value: str) -> Optional[float]:
     grouped_thousands_dot = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s))
     grouped_thousands_comma_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d{2}", s))
     grouped_thousands_dot_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d{2}", s))
-    # OCR often reads the decimal comma as a dot: "26.129,00" -> "26.129.00",
-    # "1.695,00" -> "1.695.00". Complete thousand groups plus a final 2-digit
-    # group are cents, never another thousand group.
-    grouped_thousands_dot_dot_cents = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\.\d{2}", s))
-    grouped_thousands_comma_comma_cents = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+,\d{2}", s))
-    # Mercado Pago prints cents as small superscript digits; OCR can glue a
-    # single captured digit onto complete thousand groups ("R$ 1.741" + cents
-    # -> "1.7419"). The integer part is the thousand groups; the glued digit is
-    # cents (kept below 0,50 so the rounded output stays the integer part).
-    grouped_thousands_dot_glued_digit = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d", s))
-    grouped_thousands_comma_glued_digit = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d", s))
 
-    if grouped_thousands_dot_dot_cents:
-        intpart, cents = s.rsplit(".", 1)
-        s = f"{intpart.replace('.', '')}.{cents}"
-    elif grouped_thousands_comma_comma_cents:
-        intpart, cents = s.rsplit(",", 1)
-        s = f"{intpart.replace(',', '')}.{cents}"
-    elif grouped_thousands_dot_glued_digit:
-        s = f"{s[:-1].replace('.', '')}.0{s[-1]}"
-    elif grouped_thousands_comma_glued_digit:
-        s = f"{s[:-1].replace(',', '')}.0{s[-1]}"
-    elif grouped_thousands_comma_compact_cent:
+    if grouped_thousands_comma_compact_cent:
         s = s.replace(",", "")
         s = f"{s[:-2]}.{s[-2:]}"
     elif grouped_thousands_dot_compact_cent:
@@ -1300,7 +1077,6 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             source: str,
             used_compact_fix: bool,
             followed_by_letter: bool = False,
-            candidate_value: Optional[float] = None,
         ) -> int:
             score = 30 if source == "currency" else 18
             if any(token in prev_low for token in AMOUNT_DIRECT_HINTS):
@@ -1315,15 +1091,6 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             # the transaction value, even when neighbouring lines carry strong hints.
             if any(token in line_low for token in AMOUNT_FEE_LINE_HINTS):
                 score -= 30
-            # On fee-bearing slips (TED/DOC with "TARIFA"), "TOTAL" is value+fee;
-            # the transaction value is the explicitly labeled one ("VALOR DA TED").
-            if (
-                ("total" in line_low or "total" in prev_low)
-                and "valor" not in line_low
-                and "valor" not in prev_low
-                and any(fee in full_text_low for fee in ("tarifa", "taxa"))
-            ):
-                score -= 12
             # A payment of R$ 0,00 does not exist; zero values are always fee lines
             # or OCR noise and must never win over a positive candidate.
             if re.fullmatch(r"0+(?:[.,]0+)?", raw_value):
@@ -1342,10 +1109,6 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 score -= 3
             if used_compact_fix:
                 score += 7
-            # Transfers above R$ 1 million do not happen in this operation;
-            # candidates that large are document numbers/IDs misread as values.
-            if candidate_value is not None and candidate_value > 1_000_000:
-                score -= 25
             return score
 
         def should_skip_candidate(raw_value: str, source: str, currency: Optional[str]) -> bool:
@@ -1368,13 +1131,16 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             source = "currency"
             if should_apply_compact_cent_fix(raw_value, currency, context_low):
-                # Cents are always TWO digits on Brazilian receipts. Mercado Pago
-                # prints them as small superscript digits that OCR glues onto the
-                # value ("R$ 67,37" -> "6737", "R$ 37,20" -> "3720"), so a glued
-                # no-separator token splits its last two digits as cents:
-                # "6737" -> 67,37 (not 673,7).
-                compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
-                compact_source = "currency_superscript_cent_fix" if is_mercado_pago else "currency_compact_cent_fix"
+                if is_mercado_pago and len(raw_value) == 4 and raw_value.isdigit():
+                    # Mercado Pago prints cents as small superscript digits that OCR
+                    # glues onto the value, and thousands always keep their dot
+                    # ("R$ 8.374"). A glued 4-digit token is therefore a 3-digit value
+                    # plus one captured cent digit: "8374" -> 837,4 (not 83,74).
+                    compact_value = normalize_amount(f"{raw_value[:3]},{raw_value[3:]}")
+                    compact_source = "currency_superscript_cent_fix"
+                else:
+                    compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
+                    compact_source = "currency_compact_cent_fix"
                 if compact_value is not None:
                     value = compact_value
                     used_compact_fix = True
@@ -1385,9 +1151,9 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             if after_char == "/":
                 continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
             followed_by_letter = after_char.isalpha()
-            if has_promo_marker(context_low):
+            if any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
                 continue  # promo/assistant banner amount (e.g. "R$ 50 para Ana") -> ignore
-            candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter, candidate_value=value), idx, order, value, currency, raw_value, source, used_compact_fix))
+            candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter), idx, order, value, currency, raw_value, source, used_compact_fix))
             order += 1
 
         line_has_datetime = bool(_iter_date_candidates(line) or _iter_time_candidates(line))
@@ -1407,20 +1173,13 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             if value is None:
                 continue
-            before_char = line[m.start(1) - 1] if m.start(1) > 0 else ""
             after_char = line[m.end(1):m.end(1) + 1]
-            if before_char == "/" or after_char == "/":
-                continue  # part of a date ("24/07/2026,18") or document number, not an amount
-            if after_char == ":":
-                continue  # year glued to an hour ("2026,18:10:54") is date/time noise
-            if before_char == "*" or after_char == "*":
-                continue  # masked document or Pix key ("**9.762.666-**"), not an amount
-            if after_char == ".":
-                continue  # filename/document continuation ("17.06.26.pdf", "….034.52.005")
+            if after_char == "/":
+                continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
             followed_by_letter = after_char.isalpha()
-            if has_promo_marker(context_low):
+            if any(marker in context_low for marker in AMOUNT_PROMO_MARKERS):
                 continue  # promo/assistant banner amount (e.g. "50 para Ana") -> ignore
-            candidates.append((score_candidate(raw_value, None, "fallback", False, followed_by_letter, candidate_value=value), idx, order, value, None, raw_value, "fallback", False))
+            candidates.append((score_candidate(raw_value, None, "fallback", False, followed_by_letter), idx, order, value, None, raw_value, "fallback", False))
             order += 1
 
     if not candidates:
@@ -1428,11 +1187,6 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
     best_score, best_idx, _best_order, best_value, best_currency, best_raw_value, best_source, best_used_compact_fix = candidates[0]
-    # A "winner" buried in penalties (auth-code fragment, fee footnote) is junk
-    # that only won because nothing better existed; an empty value tinted red
-    # is more honest than a fabricated one.
-    if best_score < 5:
-        return AmountParseResult(value=None, rounded_value=None, currency=None, raw_value=None, source="missing")
     if best_currency is None:
         for score, idx, _order, value, currency, _raw_value, _source, _used_fix in candidates:
             if score != best_score or idx != best_idx or value != best_value:
@@ -1599,13 +1353,7 @@ def build_sheet_payload_from_receipt(
             "value_uncertain": bool(
                 receipt_payload.get("amount") is None
                 or receipt_payload.get("amount_source") == "fallback"
-                # Glued Mercado Pago superscript cents are reconstructed by
-                # splitting digits; the split is occasionally ambiguous
-                # ("8374": 83,74 vs 837,4x), so tint for a quick human check.
-                or receipt_payload.get("amount_source") == "currency_superscript_cent_fix"
             ),
-            # Tints the row blue on the sheet so PDF receipts are recognizable.
-            "is_pdf": receipt_payload.get("source_kind") == "file_pdf",
         }
     )
     return payload
@@ -1869,174 +1617,7 @@ class WeChatDBResolver:
     def _merge_real_time_db_with_timeout(self) -> tuple[bool, str]:
         return self._merge_real_time_db_with_timeout_path(self.merge_path)
 
-    # ------------------------------------------------------------------
-    # In-process decrypt of the WeChat MSG database INCLUDING its WAL.
-    # pywxdump.all_merge_real_time_db shells out to realTime.exe, which times
-    # out on large databases and silently freezes the merge at the last WAL
-    # checkpoint (days old). WeChat pages are AES-256-CBC, 4096 bytes, IV at
-    # page[-48:-32]; WAL frames carry pages in the exact same format, so we
-    # decrypt the base file once (cached) and replay committed WAL frames.
-    # ------------------------------------------------------------------
-
-    _WAL_HEADER_SIZE = 32
-    _WAL_FRAME_HEADER_SIZE = 24
-    _PAGE_SIZE = 4096
-
-    def _derive_page_key(self, raw: bytes) -> Optional[bytes]:
-        if self._wx_key is None or len(raw) < 16:
-            return None
-        password = bytes.fromhex(self._wx_key.strip())
-        salt = raw[:16]
-        return hashlib.pbkdf2_hmac("sha1", password, salt, 64000, 32)
-
-    @staticmethod
-    def _decrypt_page(aes_key: bytes, page: bytes, skip_salt: bool) -> bytes:
-        from Cryptodome.Cipher import AES as _AES
-
-        body = page[16:] if skip_salt else page
-        iv = body[-48:-32]
-        decrypted = _AES.new(aes_key, _AES.MODE_CBC, iv).decrypt(body[:-48])
-        return decrypted + body[-48:]
-
-    def _decrypt_base_db(self, raw: bytes, aes_key: bytes) -> bytearray:
-        out = bytearray()
-        out += b"SQLite format 3\x00"
-        page = self._PAGE_SIZE
-        for i in range(0, len(raw), page):
-            chunk = raw[i:i + page]
-            if len(chunk) < page:
-                break
-            out += self._decrypt_page(aes_key, chunk, skip_salt=(i == 0))
-        return out
-
-    def _apply_wal_frames(self, out: bytearray, wal_raw: bytes, aes_key: bytes) -> int:
-        page = self._PAGE_SIZE
-        if len(wal_raw) < self._WAL_HEADER_SIZE:
-            return 0
-        wal_salt = wal_raw[16:24]
-        pos = self._WAL_HEADER_SIZE
-        pending: list[tuple[int, bytes]] = []
-        latest: dict[int, bytes] = {}
-        while pos + self._WAL_FRAME_HEADER_SIZE + page <= len(wal_raw):
-            header = wal_raw[pos:pos + self._WAL_FRAME_HEADER_SIZE]
-            frame_page = wal_raw[pos + self._WAL_FRAME_HEADER_SIZE:pos + self._WAL_FRAME_HEADER_SIZE + page]
-            pos += self._WAL_FRAME_HEADER_SIZE + page
-            if header[8:16] != wal_salt:
-                # Frame from a previous WAL generation (left over after a
-                # checkpoint restart) -- not part of the current log.
-                continue
-            pgno = int.from_bytes(header[0:4], "big")
-            commit_size = int.from_bytes(header[4:8], "big")
-            if pgno <= 0:
-                continue
-            pending.append((pgno, frame_page))
-            if commit_size:
-                for p, data in pending:
-                    latest[p] = data
-                pending = []
-        applied = 0
-        for pgno, data in latest.items():
-            decrypted = self._decrypt_page(aes_key, data, skip_salt=(pgno == 1))
-            if pgno == 1:
-                decrypted = b"SQLite format 3\x00" + decrypted
-            offset = (pgno - 1) * page
-            if len(out) < offset + page:
-                out.extend(b"\x00" * (offset + page - len(out)))
-            out[offset:offset + page] = decrypted
-            applied += 1
-        return applied
-
-    def _decrypt_db_with_wal(self, src_db: Path, out_db: Path) -> tuple[bool, str]:
-        try:
-            raw = src_db.read_bytes()
-        except Exception as exc:
-            return False, f"read_failed:{type(exc).__name__}:{exc}"
-        if len(raw) < self._PAGE_SIZE:
-            return False, "db_too_small"
-        aes_key = self._derive_page_key(raw)
-        if aes_key is None:
-            return False, "no_key"
-
-        # Cache the decrypted base: it only changes when WeChat checkpoints.
-        cache_path = out_db.parent / f"base_{src_db.stem.lower()}.cache.db"
-        meta_path = cache_path.with_suffix(".meta")
-        try:
-            stat = src_db.stat()
-            meta_now = f"{stat.st_size}|{stat.st_mtime_ns}"
-        except Exception as exc:
-            return False, f"stat_failed:{type(exc).__name__}:{exc}"
-        base: Optional[bytearray] = None
-        try:
-            if cache_path.exists() and meta_path.exists() and meta_path.read_text(encoding="utf-8") == meta_now:
-                base = bytearray(cache_path.read_bytes())
-        except Exception:
-            base = None
-        if base is None:
-            base = self._decrypt_base_db(raw, aes_key)
-            try:
-                cache_path.write_bytes(base)
-                meta_path.write_text(meta_now, encoding="utf-8")
-            except Exception:
-                pass
-
-        wal_path = src_db.with_name(src_db.name + "-wal")
-        applied = 0
-        if wal_path.exists():
-            try:
-                wal_raw = wal_path.read_bytes()
-                applied = self._apply_wal_frames(base, wal_raw, aes_key)
-            except Exception as exc:
-                return False, f"wal_apply_failed:{type(exc).__name__}:{exc}"
-        try:
-            out_db.write_bytes(base)
-        except Exception as exc:
-            return False, f"write_failed:{type(exc).__name__}:{exc}"
-        return True, f"ok:wal_pages={applied}"
-
     def _merge_real_time_db_with_timeout_path(self, target_path: Path) -> tuple[bool, str]:
-        assert self._wx_dir is not None
-        multi_dir = self._wx_dir / "Msg" / "Multi"
-        shards = sorted(multi_dir.glob("MSG*.db"), key=lambda p: p.name)
-        shards = [p for p in shards if re.fullmatch(r"msg\d+\.db", p.name.lower())]
-        if not shards:
-            return False, f"no_msg_shards_in:{multi_dir}"
-
-        decrypted: list[Path] = []
-        for shard in shards:
-            out = target_path.parent / f"de_{shard.stem.lower()}.db"
-            code, detail = self._decrypt_db_with_wal(shard, out)
-            if not code:
-                return False, f"{shard.name}:{detail}"
-            decrypted.append(out)
-
-        if len(decrypted) == 1:
-            try:
-                if target_path.exists():
-                    target_path.unlink()
-                decrypted[0].replace(target_path)
-            except Exception as exc:
-                return False, f"finalize_failed:{type(exc).__name__}:{exc}"
-            return True, "ok:single_shard"
-
-        # Multiple shards: copy the first, append the MSG rows of the rest.
-        try:
-            if target_path.exists():
-                target_path.unlink()
-            decrypted[0].replace(target_path)
-            conn = sqlite3.connect(str(target_path))
-            try:
-                for extra in decrypted[1:]:
-                    conn.execute("ATTACH DATABASE ? AS extra", (str(extra),))
-                    conn.execute("INSERT OR IGNORE INTO MSG SELECT * FROM extra.MSG")
-                    conn.commit()
-                    conn.execute("DETACH DATABASE extra")
-            finally:
-                conn.close()
-        except Exception as exc:
-            return False, f"multi_merge_failed:{type(exc).__name__}:{exc}"
-        return True, f"ok:{len(decrypted)}_shards"
-
-    def _merge_real_time_db_with_timeout_path_legacy(self, target_path: Path) -> tuple[bool, str]:
         assert self._wx_key is not None
         assert self._wx_dir is not None
 
@@ -2118,17 +1699,12 @@ class WeChatDBResolver:
                         if self.merge_path.exists():
                             self.merge_path.unlink()
                         tmp_merge_path.rename(self.merge_path)
-                        if self._last_error is not None:
-                            print(f"[RESOLVER] merge recuperado ({ret})")
                         self._last_refresh = time.time()
                         self._last_failure = 0.0
                         self._last_error = None
                     except Exception as exc:
                         self._mark_refresh_failure(time.time(), f"rename_failed:{type(exc).__name__}:{exc}")
                 else:
-                    # A failed merge silently degrades every downstream feature
-                    # (client attribution, msg dedup, ordering) -- make it visible.
-                    print(f"[RESOLVER] merge_failed: {str(ret)[:200]}")
                     self._mark_refresh_failure(time.time(), f"merge_failed:{ret}")
                     try:
                         if tmp_merge_path.exists():
@@ -2282,88 +1858,6 @@ class WeChatDBResolver:
                 msg_paths.add(path_to_normalized_windows(msg.image_abs_path))
             if msg.thumb_abs_path is not None:
                 msg_paths.add(path_to_normalized_windows(msg.thumb_abs_path))
-            if path_norms & msg_paths:
-                return msg
-        return None
-
-    def _extract_attached_file_path(self, bytes_extra: Any) -> Optional[str]:
-        try:
-            decoded = self._decode_bytes_extra(bytes_extra) if self._decode_bytes_extra else {}
-        except Exception:
-            decoded = {}
-        items = decoded.get("3") if isinstance(decoded, dict) else None
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                value = str(item.get("2") or "").strip()
-                if "\\filestorage\\file\\" in value.lower().replace("/", "\\"):
-                    return value
-        raw_text = str(decoded)
-        match = re.search(r"(wxid_[^\\']+\\FileStorage\\File\\[^']+?\.(?:pdf|PDF))", raw_text)
-        return match.group(1) if match else None
-
-    def _recent_file_messages(
-        self,
-        pivot_ts: float,
-        lookback_sec: int,
-        lookahead_sec: int,
-        limit: int = 120,
-    ) -> list[WeChatMessageRef]:
-        if not self.refresh_if_due():
-            return []
-        if not self.merge_path.exists():
-            return []
-        lower = max(0, int(pivot_ts) - max(5, int(lookback_sec)))
-        upper = int(pivot_ts) + max(1, int(lookahead_sec))
-        conn = sqlite3.connect(str(self.merge_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                """
-                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
-                FROM MSG
-                WHERE Type=49
-                  AND CreateTime BETWEEN ? AND ?
-                ORDER BY ABS(CreateTime - ?) ASC, CreateTime DESC
-                LIMIT ?
-                """,
-                (lower, upper, int(pivot_ts), int(max(1, limit))),
-            ).fetchall()
-        finally:
-            conn.close()
-
-        out: list[WeChatMessageRef] = []
-        for row in rows:
-            file_rel = self._extract_attached_file_path(row["BytesExtra"])
-            if not file_rel:
-                continue
-            out.append(
-                WeChatMessageRef(
-                    msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
-                    talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
-                    create_time=float(row["CreateTime"]),
-                    sender_user_name=None,
-                    sender_display=None,
-                    image_rel_path=file_rel,
-                    thumb_rel_path=None,
-                    image_abs_path=self._absolute_path_from_rel(file_rel),
-                    thumb_abs_path=None,
-                )
-            )
-        return out
-
-    def find_file_message_for_path(self, path: Path, pivot_ts: float) -> Optional[WeChatMessageRef]:
-        """Match an attachment file (e.g. a receipt PDF) to its Type=49 message.
-
-        Users download a PDF minutes after the message arrives (file mtime =
-        download time), so the lookback is much wider than for auto-saved images.
-        """
-        path_norms = self._candidate_norms(path)
-        for msg in self._recent_file_messages(pivot_ts, lookback_sec=6 * 3600, lookahead_sec=120, limit=200):
-            msg_paths = {normalize_windows_text(msg.image_rel_path)} if msg.image_rel_path else set()
-            if msg.image_abs_path is not None:
-                msg_paths.add(path_to_normalized_windows(msg.image_abs_path))
             if path_norms & msg_paths:
                 return msg
         return None
@@ -3692,23 +3186,6 @@ class StateDB:
             row = self._conn.execute("SELECT 1 FROM receipts WHERE msg_svr_id=? LIMIT 1", (str(msg_svr_id),)).fetchone()
             return row is not None
 
-    def find_recent_valued_receipts(self, since_ts: float, limit: int = 300) -> list[tuple[Optional[str], Optional[str], str]]:
-        """Recent receipts WITH a value: (talker, client, ocr_text).
-
-        Used to detect 'continuation' prints -- a second screenshot of the same
-        receipt, scrolled down to the sender data, carrying no value.
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT talker, client, ocr_text FROM receipts
-                WHERE ingested_at > ? AND amount IS NOT NULL
-                ORDER BY ingested_at DESC LIMIT ?
-                """,
-                (float(since_ts), int(limit)),
-            ).fetchall()
-        return [(r[0], r[1], r[2] or "") for r in rows]
-
     def requeue_mapped_missing_client(
         self,
         resolver: "ClientResolver",
@@ -4993,11 +4470,12 @@ class GoogleSheetsSink(RowSink):
             return self.review_worksheet
         return main_title
 
-    def _apply_row_highlight(self, worksheet: Any, row_idx: int, color: dict[str, float]) -> None:
-        # Tint the whole row: red = guessed/unreadable value, blue = PDF receipt,
-        # white = trustworthy image read. Never let a formatting hiccup break
-        # ingestion.
+    def _apply_row_highlight(self, worksheet: Any, row_idx: int, uncertain: bool) -> None:
+        # Tint the whole row light red when the value was guessed/unreadable, or
+        # clear it back to white when the value is trustworthy. Never let a
+        # formatting hiccup break ingestion.
         row_value = max(2, int(row_idx))
+        color = SHEET_GUESS_COLOR if uncertain else SHEET_CLEAR_COLOR
         try:
             worksheet.format(
                 sheet_row_range(self.headers, row_value),
@@ -5017,7 +4495,7 @@ class GoogleSheetsSink(RowSink):
                 table_range=sheet_table_range(self.headers),
             )
             row_idx = len(worksheet.col_values(1))
-            self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
+            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
             return title, row_idx
 
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
@@ -5032,7 +4510,7 @@ class GoogleSheetsSink(RowSink):
                 values=[build_sink_row_values(row_payload)],
                 value_input_option="USER_ENTERED",
             )
-            self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
+            self._apply_row_highlight(worksheet, row_idx, bool(row_payload.get("value_uncertain")))
 
 
 class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
@@ -5560,32 +5038,6 @@ def resolve_media_candidate(
     manual_session_started_at = db.get_manual_session_started_at() if manual_materialization_mode else None
     manual_session_id = item.manual_session_id
 
-    if original_source_kind == "file_pdf":
-        # A downloaded PDF is already the full document; the only work is to
-        # attribute it to a group via its Type=49 message in the WeChat DB.
-        runtime_resolver = runtime_media_resolver(media_resolver)
-        msg_ref = (
-            runtime_resolver.find_file_message_for_path(original_path, item.mtime)
-            if runtime_resolver is not None
-            else None
-        )
-        client_source_path = original_path
-        if msg_ref is not None and msg_ref.talker:
-            group_hash = hashlib.md5(str(msg_ref.talker).encode("utf-8")).hexdigest()
-            # Synthetic MsgAttach-style path so the existing group-id extraction
-            # and client map lookup work unchanged for PDFs.
-            client_source_path = original_path.parent / "MsgAttach" / group_hash / original_path.name
-        return MediaResolution(
-            original_source_path=original_path,
-            original_source_kind=original_source_kind,
-            resolved_path=original_path,
-            resolved_source_kind="file_pdf",
-            client_source_path=client_source_path,
-            resolution_source="file_pdf",
-            verification_status="CONFIRMADO",
-            msg_ref=msg_ref,
-        )
-
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
             item.mtime,
@@ -5918,11 +5370,7 @@ def process_item(
                 or gid == "9e20f478899dc29eb19741386f9343c8"
             )
             is_manual_open = (item.source_kind == "temp_image" or bool(item.manual_session_id))
-            # A PDF whose message correlation has not resolved after a few held
-            # attempts (~10 min) still gets launched, with client "-", instead of
-            # waiting forever.
-            is_pdf_after_grace = (item.source_kind == "file_pdf" and item.attempts >= 5)
-            if is_file_transfer or is_manual_open or is_pdf_after_grace:
+            if is_file_transfer or is_manual_open:
                 client = "-"
                 print(f"[INFO] {path.name} | grupo_sem_mapa={gid} mas prosseguindo (abertura manual/file_transfer)")
             else:
@@ -5931,14 +5379,7 @@ def process_item(
                 return
 
         open_started_at = time.perf_counter()
-        pdf_text: Optional[str] = None
-        if resolution.resolved_source_kind == "file_pdf":
-            pdf_text, pdf_img, img_bytes = load_pdf_receipt(path)
-            # With a text layer there is nothing to OCR; the placeholder image is
-            # never rendered anywhere.
-            img = pdf_img if pdf_img is not None else Image.new("RGB", (8, 8), "white")
-        else:
-            img, img_bytes, _ext, _key = open_image_from_file(path)
+        img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
 
@@ -5949,126 +5390,16 @@ def process_item(
         #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
         #     return
 
-        ocr_spans: Optional[list[OCRSpan]] = None
-        if pdf_text is not None:
-            # Embedded PDF text layer: exact characters, no OCR involved.
-            q_score = 1.0
-            img_for_ocr = img
-            prep_ms = 0.0
-            text, ocr_conf = pdf_text, 1.0
-            ocr_ms = 0.0
-        else:
-            q_score = quality_score(img)
+        q_score = quality_score(img)
 
-            prep_started_at = time.perf_counter()
-            img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
-            prep_ms = perf_duration_ms(prep_started_at)
-            ocr_started_at = time.perf_counter()
-            ocr_spans = ocr.extract_detailed(img_for_ocr)
-            if ocr_spans is not None:
-                text = "\n".join(s.text for s in ocr_spans if s.text.strip())
-                confs = [s.conf for s in ocr_spans]
-                ocr_conf = round(max(0.0, min(1.0, (sum(confs) / len(confs)) if confs else 0.0)), 4)
-            else:
-                text, ocr_conf = ocr.extract(img_for_ocr)
-            ocr_ms = perf_duration_ms(ocr_started_at)
+        prep_started_at = time.perf_counter()
+        img_for_ocr = prepare_image_for_ocr(img, resolution.resolved_source_kind)
+        prep_ms = perf_duration_ms(prep_started_at)
+        ocr_started_at = time.perf_counter()
+        text, ocr_conf = ocr.extract(img_for_ocr)
+        ocr_ms = perf_duration_ms(ocr_started_at)
         ocr_chars = len(text)
         is_receipt, receipt_reason = looks_like_single_receipt(text)
-
-        # One photo with SEVERAL printed receipts (deposit slips side by side):
-        # split by "COMPROVANTE DE ..." anchors and launch one row per slip.
-        if pdf_text is None and ocr_spans:
-            segments = split_receipt_segments(ocr_spans)
-            if len(segments) >= 2:
-                staged = 0
-                ingested_at = time.time()
-                for seg_idx, seg_text in enumerate(segments, 1):
-                    seg_ok, _seg_reason = looks_like_single_receipt(seg_text)
-                    if not seg_ok:
-                        continue
-                    seg_fields = parse_receipt_fields(seg_text, ocr_conf=ocr_conf, q_score=q_score)
-                    seg_bank = seg_fields.get("bank")
-                    if seg_bank is None:
-                        seg_bank = detect_bank(f"{seg_text}\n{client}", seg_fields.get("beneficiary"))
-                        seg_fields["bank"] = seg_bank
-                    # Stricter than the single path: a real slip has its own value
-                    # AND its own date; anything less is noise from the split (or
-                    # a long single receipt wrongly divided).
-                    if (
-                        seg_fields.get("amount") is None
-                        or seg_fields.get("txn_date_source") != "parsed"
-                        or not has_core_signal(seg_fields, seg_bank)
-                    ):
-                        continue
-                    seg_review = compute_review_needed(
-                        fields=seg_fields,
-                        bank=seg_bank,
-                        quality_score_value=q_score,
-                        verification_status=resolution.verification_status,
-                        min_confidence=cfg.min_confidence,
-                        resolution_source=resolution.resolution_source,
-                    )
-                    seg_payload: dict[str, Any] = {
-                        "file_id": f"{item.file_id}#p{seg_idx}",
-                        "source_path": str(resolution.original_source_path),
-                        "source_kind": resolution.original_source_kind,
-                        "ingested_at": ingested_at,
-                        "sha256": digest,
-                        "txn_date": seg_fields["txn_date"],
-                        "txn_time": seg_fields["txn_time"],
-                        "txn_date_source": seg_fields.get("txn_date_source"),
-                        "txn_time_source": seg_fields.get("txn_time_source"),
-                        "client": client,
-                        "bank": seg_bank,
-                        "beneficiary": seg_fields["beneficiary"],
-                        "amount": seg_fields["amount"],
-                        "amount_raw": seg_fields.get("amount_raw"),
-                        "amount_rounded": seg_fields.get("amount_rounded"),
-                        "amount_source": seg_fields.get("amount_source"),
-                        "currency": seg_fields["currency"],
-                        "parse_conf": seg_fields["parse_conf"],
-                        "quality_score": q_score,
-                        "ocr_engine": ocr.name,
-                        "ocr_conf": ocr_conf,
-                        "ocr_chars": len(seg_text),
-                        "review_needed": seg_review,
-                        "ocr_text": seg_text[:25000],
-                        "parser_json": json.dumps(seg_fields, ensure_ascii=False),
-                        "msg_svr_id": msg_svr_id,
-                        "talker": resolution.msg_ref.talker if resolution.msg_ref is not None else None,
-                        "msg_create_time": resolution.msg_ref.create_time if resolution.msg_ref is not None else None,
-                        "manual_session_id": item.manual_session_id,
-                        "resolved_media_path": str(path),
-                        "resolution_source": resolution.resolution_source,
-                        "verification_status": resolution.verification_status,
-                    }
-                    seg_row_payload = build_sheet_payload_from_receipt(seg_payload)
-                    seg_payload["sheet_status"] = "SINK_PENDING"
-                    seg_payload["sheet_payload_json"] = json.dumps(seg_row_payload, ensure_ascii=False)
-                    seg_payload["sheet_next_attempt"] = 0.0
-                    seg_payload["sheet_last_error"] = None
-                    seg_payload["sheet_committed_at"] = None
-                    seg_payload["excel_sheet"] = None
-                    seg_payload["excel_row"] = None
-                    db.insert_receipt(seg_payload)
-                    staged += 1
-                    print(
-                        f"[OK] {path.name}#p{seg_idx} | cliente={client} | banco={seg_bank} "
-                        f"| valor={seg_fields['amount']} | data={seg_fields['txn_date']} {seg_fields['txn_time']} "
-                        f"| sink=staged | multi_receipt={seg_idx}/{len(segments)} "
-                        f"| resolution={resolution.resolution_source} | verification={resolution.verification_status}"
-                    )
-                if staged >= 1:
-                    db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
-                    db.resolve_related_file_paths(
-                        source_path=resolution.original_source_path,
-                        exclude_file_id=item.file_id,
-                        sha256=digest,
-                    )
-                    db.resolve_message_job_paths(msg_svr_id, exclude_file_id=item.file_id, sha256=digest)
-                    db.mark_message_job_resolved(msg_svr_id, note=f"MULTI_RECEIPT_{staged}")
-                    print(f"[OK] {path.name} | multi_receipt: {staged} comprovantes lancados de {len(segments)} segmentos")
-                    return
 
         # Raw image fallback logic if text is not a receipt or amount (valor) is missing
         has_amount = False
@@ -6124,37 +5455,6 @@ def process_item(
         if bank is None:
             bank = detect_bank(f"{text}\n{client}", fields.get("beneficiary"))
             fields["bank"] = bank
-
-        # Some clients (e.g. 116A) send a SECOND print of the same receipt,
-        # scrolled down to show the sender -- no value on it. Detect it by the
-        # shared Pix transaction id (decisive) or by the sender-only signature,
-        # and skip instead of adding a junk row. Never applies to prints that
-        # carry a value, so intentional duplicates still produce two rows.
-        if fields.get("amount") is None:
-            own_ids = extract_pix_transaction_ids(text)
-            talker_now = resolution.msg_ref.talker if resolution.msg_ref is not None else None
-            continuation_of = None
-            recent_valued = db.find_recent_valued_receipts(since_ts=time.time() - 1800)
-            if own_ids:
-                for r_talker, r_client, r_text in recent_valued:
-                    if own_ids & extract_pix_transaction_ids(r_text):
-                        continuation_of = "mesmo_id_pix"
-                        break
-            if continuation_of is None and looks_like_sender_continuation(text):
-                cutoff_short = time.time() - 300
-                for r_talker, r_client, r_text in db.find_recent_valued_receipts(since_ts=cutoff_short, limit=50):
-                    same_conv = (talker_now and r_talker == talker_now) or (
-                        client not in (None, "", "-") and r_client == client
-                    )
-                    if same_conv:
-                        continuation_of = "mesmo_grupo_sem_valor"
-                        break
-            if continuation_of is not None:
-                db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note=f"CONTINUATION_PRINT:{continuation_of}")
-                db.mark_message_job_resolved(msg_svr_id, note=f"CONTINUATION_PRINT:{continuation_of}")
-                print(f"[SKIP] {path.name} | continuacao_do_comprovante_anterior ({continuation_of})")
-                return
-
         if not has_core_signal(fields, bank):
             db.mark_exception(item.file_id, reason="EXCEPTION_MISSING_CORE_FIELDS")
             db.set_meta("last_exception_reason", "EXCEPTION_MISSING_CORE_FIELDS")
@@ -6193,7 +5493,7 @@ def process_item(
             "currency": fields["currency"],
             "parse_conf": fields["parse_conf"],
             "quality_score": q_score,
-            "ocr_engine": "pdf_text" if pdf_text is not None else ocr.name,
+            "ocr_engine": ocr.name,
             "ocr_conf": ocr_conf,
             "ocr_chars": ocr_chars,
             "review_needed": review_needed,

@@ -344,6 +344,99 @@ class ParseReceiptFieldsTests(unittest.TestCase):
         self.assertIn(("1850.0", "09:51")[0] and 1850.0, [v for v, _ in parsed])
         self.assertEqual(sorted(t for _, t in parsed), sorted(["09:51", "09:43", "09:46", "09:47", "09:48", "09:58"]))
 
+    def test_pix_transaction_id_extracted_even_when_split_across_lines(self) -> None:
+        from wechat_receipt_daemon import extract_pix_transaction_ids
+
+        # Part 1 (with value): id broken across two lines by OCR.
+        parte1 = "ID da transacao\nE182361202026072\n41838s0035c5cb09\nDestino"
+        # Part 2 (sender print): same id in one line.
+        parte2 = "ID da transacao:\nE18236120202607241838s0035c5cb09\nEstamos aqui para ajudar"
+        ids1 = extract_pix_transaction_ids(parte1)
+        ids2 = extract_pix_transaction_ids(parte2)
+        self.assertTrue(ids1 & ids2)
+
+    def test_sender_only_print_is_flagged_as_continuation(self) -> None:
+        from wechat_receipt_daemon import looks_like_sender_continuation
+
+        parte2 = "\n".join(
+            [
+                "Origem",
+                "Nome Leandro Coelho dos Santos",
+                "Instituicao NU PAGAMENTOS - IP",
+                "CPF ***.086.327-**",
+                "Informacoes adicionais",
+                "Identificador AMD",
+            ]
+        )
+        self.assertTrue(looks_like_sender_continuation(parte2))
+        # A full receipt still shows the "Valor" label even when OCR misses digits.
+        parte1 = "Comprovante de pagamento\n24 JUL 2026 - 15:38:18\nValor R$ 5.400,00\nOrigem"
+        self.assertFalse(looks_like_sender_continuation(parte1))
+
+    def test_promo_marker_does_not_match_inside_payer_names(self) -> None:
+        # Real regression found 26/07/2026: "audio" matched inside "Claudio" and
+        # "RECAUDIOVISUAL", discarding the true value of legitimate receipts.
+        text = "\n".join(
+            [
+                "Comprovante de Pagamento Pix",
+                "Sicredi",
+                "Valor: RS 2.447,00",
+                "Realizado em: 17/06/2026 - 14:04:01",
+                "Solicitante: CLAUDIO NAPOLEAO PERTINHEZ",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.95, q_score=0.9)
+        self.assertEqual(fields["amount"], 2447.0)
+
+        text2 = "\n".join(
+            [
+                "valordatransferencia",
+                "R$10.000,00",
+                "de",
+                "RECAUDIOVISUALPRODUTORALTDA",
+            ]
+        )
+        fields2 = parse_receipt_fields(text2, ocr_conf=0.95, q_score=0.9)
+        self.assertEqual(fields2["amount"], 10000.0)
+
+    def test_ocr_mangled_promo_banner_still_ignored(self) -> None:
+        # Real regression risk 26/07/2026: OCR glues the banner words
+        # ("mensagemouaudio", "Baixeoappeconheca"); two distinct markers in the
+        # context, even glued, must still discard the banner value.
+        text = "\n".join(
+            [
+                "ComprovantedePix",
+                "3/julho/2026as20:59:39.",
+                "R$ 165",
+                "De",
+                "PajntiSuya",
+                "MercadoPago",
+                "Assistente pessoal",
+                "FacaPixepagamentospor",
+                "RS 50 pers Ane 3",
+                "Fega um Pix de",
+                "mensagemouaudio",
+                "Baixeoappeconheca!",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.95, q_score=0.9)
+        self.assertEqual(fields["amount"], 165.0)
+
+    def test_promo_banner_with_standalone_marker_still_ignored(self) -> None:
+        # The Mercado Pago assistant banner must still be discarded.
+        text = "\n".join(
+            [
+                "Envie um audio para o assistente",
+                "R$ 50 para Ana",
+                "baixe o app",
+                "Comprovante de Pix",
+                "Valor",
+                "R$ 730,00",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.95, q_score=0.9)
+        self.assertEqual(fields["amount"], 730.0)
+
     def test_single_receipt_is_not_split(self) -> None:
         from wechat_receipt_daemon import OCRSpan, split_receipt_segments
 
