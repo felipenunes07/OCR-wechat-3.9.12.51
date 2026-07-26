@@ -612,6 +612,7 @@ CLIENT_LABEL_SPECIAL_CASES = {
     "PP": "6",
 }
 IGNORED_SENDER_USERNAMES = {
+    "filehelper",  # "File Transfer" self-chat: user sends files to themselves, never client receipts
     "wxid_wml3ftd6qpea12",
     "wxid_jhb1tt23of8422",
     "wxid_5sd4qzz1lyhl12",
@@ -988,8 +989,29 @@ def normalize_amount(value: str) -> Optional[float]:
     grouped_thousands_dot = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+", s))
     grouped_thousands_comma_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d{2}", s))
     grouped_thousands_dot_compact_cent = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d{2}", s))
+    # OCR often reads the decimal comma as a dot: "26.129,00" -> "26.129.00",
+    # "1.695,00" -> "1.695.00". Complete thousand groups plus a final 2-digit
+    # group are cents, never another thousand group.
+    grouped_thousands_dot_dot_cents = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\.\d{2}", s))
+    grouped_thousands_comma_comma_cents = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+,\d{2}", s))
+    # Mercado Pago prints cents as small superscript digits; OCR can glue a
+    # single captured digit onto complete thousand groups ("R$ 1.741" + cents
+    # -> "1.7419"). The integer part is the thousand groups; the glued digit is
+    # cents (kept below 0,50 so the rounded output stays the integer part).
+    grouped_thousands_dot_glued_digit = bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})+\d", s))
+    grouped_thousands_comma_glued_digit = bool(re.fullmatch(r"\d{1,3}(?:,\d{3})+\d", s))
 
-    if grouped_thousands_comma_compact_cent:
+    if grouped_thousands_dot_dot_cents:
+        intpart, cents = s.rsplit(".", 1)
+        s = f"{intpart.replace('.', '')}.{cents}"
+    elif grouped_thousands_comma_comma_cents:
+        intpart, cents = s.rsplit(",", 1)
+        s = f"{intpart.replace(',', '')}.{cents}"
+    elif grouped_thousands_dot_glued_digit:
+        s = f"{s[:-1].replace('.', '')}.0{s[-1]}"
+    elif grouped_thousands_comma_glued_digit:
+        s = f"{s[:-1].replace(',', '')}.0{s[-1]}"
+    elif grouped_thousands_comma_compact_cent:
         s = s.replace(",", "")
         s = f"{s[:-2]}.{s[-2:]}"
     elif grouped_thousands_dot_compact_cent:
@@ -1131,16 +1153,13 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             value = normalize_amount(raw_value)
             source = "currency"
             if should_apply_compact_cent_fix(raw_value, currency, context_low):
-                if is_mercado_pago and len(raw_value) == 4 and raw_value.isdigit():
-                    # Mercado Pago prints cents as small superscript digits that OCR
-                    # glues onto the value, and thousands always keep their dot
-                    # ("R$ 8.374"). A glued 4-digit token is therefore a 3-digit value
-                    # plus one captured cent digit: "8374" -> 837,4 (not 83,74).
-                    compact_value = normalize_amount(f"{raw_value[:3]},{raw_value[3:]}")
-                    compact_source = "currency_superscript_cent_fix"
-                else:
-                    compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
-                    compact_source = "currency_compact_cent_fix"
+                # Cents are always TWO digits on Brazilian receipts. Mercado Pago
+                # prints them as small superscript digits that OCR glues onto the
+                # value ("R$ 67,37" -> "6737", "R$ 37,20" -> "3720"), so a glued
+                # no-separator token splits its last two digits as cents:
+                # "6737" -> 67,37 (not 673,7).
+                compact_value = normalize_amount(f"{raw_value[:-2]},{raw_value[-2:]}")
+                compact_source = "currency_superscript_cent_fix" if is_mercado_pago else "currency_compact_cent_fix"
                 if compact_value is not None:
                     value = compact_value
                     used_compact_fix = True
