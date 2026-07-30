@@ -1,0 +1,99 @@
+Watch roots:
+ - C:\Users\Felipe\Documents\WeChat Files\wxid_xd3703k0ih2p22\FileStorage
+DB: C:\Users\Felipe\Desktop\Wechat Automation\OCR-wechat-3.9.12.51\wechat_receipt_state.db
+Sink mode: google-sheets
+Google Sheets ref: https://docs.google.com/spreadsheets/d/14_O2qiXu-TYAhz2LeG0wEmjxxaNDpyU16CQiuo0Wf8c/edit?usp=sharing
+Google credentials: C:\Users\Felipe\Desktop\Wechat Automation\OCR-wechat-3.9.12.51\google_service_account.json
+Client map: C:\Users\Felipe\Desktop\Wechat Automation\OCR-wechat-3.9.12.51\clientes_grupos.json
+Recent files window (hours): 24
+Resolution mode: db-first
+DB merge path: C:\Users\Felipe\Desktop\Wechat Automation\OCR-wechat-3.9.12.51\.runtime\wechat_merge.db
+Settle (seconds): 1
+Original wait (seconds): 7
+Temp correlation (seconds): 30
+Thumb candidates enabled: False
+Manual order guard: False
+Manual burst gap (seconds): 2
+Manual burst max (seconds): 8
+Verification column: STATUS_VERIFICACAO
+UI force download: False
+UI force delay (seconds): 15
+UI force scope: mapped-groups
+UI focus policy: immediate
+UI batch mode: group-sequential
+UI item timeout (seconds): 5
+UI retry backoff (seconds): [5, 10, 20, 40]
+UI window backends: ['win32', 'uia']
+UI window classes: ['WeChatMainWndForPC', 'Base_PowerMessageWindow', 'Chrome_WidgetWin_0']
+Sheet order scope: per_talker
+Sheet materialization order: desc
+Sheet commit order: asc
+Process existing files on startup: False
+[RECOVER] ignored_startup_backlog=25
+Google Sheets: Automação Judy | main=Página1 | review=Página1 | auth=service_account:google_service_account.json
+WeChat DB resolver: enabled | wx_dir=C:\Users\Felipe\Documents\WeChat Files\wxid_xd3703k0ih2p22 | merge=C:\Users\Felipe\Desktop\Wechat Automation\OCR-wechat-3.9.12.51\.runtime\wechat_merge.db
+UI force runtime enabled: False
+[RECOVER] backfilled_receipt_fields=243 | sheet_updated=0 | sheet_failed=0
+OCR engine: rapidocr
+[OCR] warmup_complete | ms=165
+Watchdog: enabled
+UI force download worker: disabled
+[SCAN] reconcile complete | queued_or_refreshed=0
+[SCAN] reconcile complete | queued_or_refreshed=0
+[SCAN] reconcile complete | queued_or_refreshed=2
+[HOLD] 1785378127109.jpg | waiting_temp_context
+[HOLD] 1785378127187.jpg | waiting_temp_context
+[SKIP] 1785378127109.jpg | temp_without_unique_context
+[SKIP] 1785378127187.jpg | temp_without_unique_context
+[HOLD] 1785378134210.jpg | waiting_temp_context
+[HOLD] 1785378134220.jpg | waiting_temp_context
+[SKIP] 1785378134210.jpg | temp_without_unique_context
+[SKIP] 1785378134220.jpg | temp_without_unique_context
+[HOLD] 1785378147831.jpg | waiting_temp_context
+[HOLD] 1785378147847.jpg | waiting_temp_context
+[OCR] Attempting raw image fallback for 938c65dd430a8bb9863edaeb8f994002.dat (is_receipt=False, has_amount=False)
+[SKIP] 938c65dd430a8bb9863edaeb8f994002.dat | not_receipt=TABULAR_TRANSFER_LIST
+[RETRY] c8fd63971fe0e5b98aec9c18701a7f57.dat | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] 1785378147831.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378147847.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151661.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151724.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[OK] COMPROVANTE AMD-38.000,00.pdf | cliente=116A | banco=AMD | valor=38000.0 | data=29/07/2026 11:05 | sink=staged | resolution=file_pdf | verification=CONFIRMADO | manual_open_to_claim_ms=42887380 | open_ms=541 | prep_ms=0 | ocr_ms=0 | parse_ms=1 | manual_open_to_ingest_ms=42888162
+[SINK] committed | file_id=7f9d234dbfe5f053cc6c4b0727092197099eed4a | msg=7606990614443853404 | talker=27108225505@chatroom | create_time=1785335301 | sheet=Página1 | row=254 | ingest_to_commit_ms=1141 | manual_open_to_commit_ms=42889304
+[OK] COMPROVANTE AMD 42.000,00.pdf | cliente=116A | banco=AMD | valor=42000.0 | data=29/07/2026 11:04 | sink=staged | resolution=file_pdf | verification=CONFIRMADO | manual_open_to_claim_ms=42880642 | open_ms=12 | prep_ms=0 | ocr_ms=0 | parse_ms=1 | manual_open_to_ingest_ms=42880820
+[SINK] committed | file_id=8b9203434cc69ab16ad43eafae2b59dfe53ee546 | msg=4000472696900681630 | talker=27108225505@chatroom | create_time=1785335310 | sheet=Página1 | row=255 | ingest_to_commit_ms=1001 | manual_open_to_commit_ms=42881820
+[RETRY] c8fd63971fe0e5b98aec9c18701a7f57.dat | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151661.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151724.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[SCAN] reconcile complete | queued_or_refreshed=10
+[RETRY] 1785378147831.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378147847.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378227163.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] 1785378227210.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[OCR] Attempting raw image fallback for 7f76224875147795a47696b86f8c3f95.dat (is_receipt=False, has_amount=False)
+[SKIP] 7f76224875147795a47696b86f8c3f95.dat | not_receipt=TABULAR_TRANSFER_LIST
+[RETRY] c9b8de72dd433c8798e45a6d5bc37535.dat | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242969.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242985.jpg | attempt=1 | err=OperationalError: no such table: Contact
+[RETRY] c8fd63971fe0e5b98aec9c18701a7f57.dat | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151661.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378151724.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[SKIP] bb4d78277c9a886d081aef48bf5f4f7d.dat | IGNORED_CLIENT_LABEL_DECORATIVE
+[SKIP] 1785378227163.jpg | temp_without_unique_context
+[SKIP] 1785378227210.jpg | temp_without_unique_context
+[HOLD] 15d552870ea7946cb8cbb429094b7680_.jpg | waiting_temp_context
+[SKIP] 15d552870ea7946cb8cbb429094b7680_.jpg | temp_without_unique_context
+[RETRY] c9b8de72dd433c8798e45a6d5bc37535.dat | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242969.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242985.jpg | attempt=2 | err=OperationalError: no such table: Contact
+[SKIP] c5268b5a8340d8563ed2ae366db94e12.dat | IGNORED_BY_USER
+[SKIP] 1785378298321.jpg | IGNORED_BY_USER
+[SKIP] 1785378298321(1).jpg | IGNORED_BY_USER
+[SKIP] 1785378302232.jpg | IGNORED_BY_USER
+[SKIP] 1785378302232(1).jpg | IGNORED_BY_USER
+[SCAN] reconcile complete | queued_or_refreshed=22
+[RETRY] c9b8de72dd433c8798e45a6d5bc37535.dat | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242969.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378242985.jpg | attempt=3 | err=OperationalError: no such table: Contact
+[RETRY] 1785378147831.jpg | attempt=4 | err=OperationalError: no such table: Contact
+[RETRY] 1785378147847.jpg | attempt=4 | err=OperationalError: no such table: Contact

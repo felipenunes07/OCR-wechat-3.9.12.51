@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from wechat_receipt_daemon import (
     candidate_initial_delay_seconds,
     hold_retry_delay_seconds,
     is_candidate,
+    is_stale_pdf_modify,
     looks_like_single_receipt,
     normalize_amount,
     normalize_client_label,
@@ -82,7 +84,7 @@ class PrepareImageForOCRTests(unittest.TestCase):
 class RuntimeMediaResolverTests(unittest.TestCase):
     def test_returns_none_when_resolver_is_degraded(self) -> None:
         resolver = WeChatDBResolver.__new__(WeChatDBResolver)
-        resolver._last_error = "merge_failed:timeout"
+        resolver._last_error = "pywxdump_unavailable"
 
         self.assertIsNone(runtime_media_resolver(resolver))
 
@@ -91,6 +93,32 @@ class RuntimeMediaResolverTests(unittest.TestCase):
         resolver._last_error = None
 
         self.assertIs(runtime_media_resolver(resolver), resolver)
+
+    def test_merge_failure_keeps_resolver_while_stale_index_exists(self) -> None:
+        # Real regression 29/07/2026: one WinError 32 during the index swap set
+        # a sticky rename_failed error; gating the resolver off on it meant
+        # refresh_if_due() was never called again, so the failure could never
+        # clear and every PDF held forever. A stale index is still queryable.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stale_index = Path(tmp_dir) / "wechat_merge.db"
+            stale_index.write_bytes(b"")
+            resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+            resolver.merge_path = stale_index
+            resolver._last_error = (
+                "rename_failed:PermissionError:[WinError 32] O arquivo ja esta "
+                "sendo usado por outro processo"
+            )
+            self.assertIs(runtime_media_resolver(resolver), resolver)
+
+            resolver._last_error = "merge_failed:timeout"
+            self.assertIs(runtime_media_resolver(resolver), resolver)
+
+    def test_merge_failure_without_index_on_disk_disables_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+            resolver.merge_path = Path(tmp_dir) / "nunca_criado.db"
+            resolver._last_error = "merge_failed:timeout"
+            self.assertIsNone(runtime_media_resolver(resolver))
 
 
 class ParseReceiptFieldsTests(unittest.TestCase):
@@ -1409,6 +1437,10 @@ class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
         resolver._lock = threading.Lock()
         resolver._merge_thread = None
         resolver._merge_thread_lock = threading.Lock()
+        resolver._merge_started_at = 0.0
+        resolver._merge_seq = 0
+        resolver.merge_stall_seconds = 300
+        resolver._newest_msg_cache = (0.0, 0.0)
         resolver._load_account_info = lambda force=False: True
         return resolver
 
@@ -1461,6 +1493,135 @@ class WeChatDBResolverMergeRunnerTests(unittest.TestCase):
             self.assertEqual(merge_calls, ["merge", "merge"])
             self.assertEqual(resolver._last_failure, 0.0)
             self.assertIsNone(resolver.last_error)
+
+    def test_refresh_if_due_restarts_a_wedged_merge(self) -> None:
+        """A merge thread that never returns used to freeze the index forever."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = self._build_resolver(tmp_dir)
+            release = threading.Event()
+            entered = threading.Semaphore(0)
+            merge_calls: list[str] = []
+
+            def fake_merge(target_path) -> tuple[bool, str]:
+                merge_calls.append("merge")
+                entered.release()
+                release.wait(timeout=10)
+                return True, "ok"
+
+            resolver._merge_real_time_db_with_timeout_path = fake_merge
+            wedged = None
+            try:
+                with patch("wechat_receipt_daemon.time.time", return_value=100.0):
+                    resolver.refresh_if_due()
+                wedged = resolver._merge_thread
+                self.assertTrue(entered.acquire(timeout=10))
+                self.assertEqual(merge_calls, ["merge"])
+
+                # Still inside the stall window: no second attempt.
+                with patch("wechat_receipt_daemon.time.time", return_value=200.0):
+                    resolver.refresh_if_due(force=True)
+                self.assertEqual(merge_calls, ["merge"])
+
+                # Past it: the wedge is reported and a fresh attempt starts.
+                with patch("wechat_receipt_daemon.time.time", return_value=500.0):
+                    resolver.refresh_if_due(force=True)
+                self.assertTrue(entered.acquire(timeout=10))
+                self.assertEqual(merge_calls, ["merge", "merge"])
+                self.assertIsNotNone(resolver.last_error)
+                self.assertTrue(str(resolver.last_error).startswith("merge_stalled:"))
+            finally:
+                release.set()
+                for thread in (wedged, resolver._merge_thread):
+                    if thread is not None:
+                        thread.join(timeout=10)
+
+
+class PdfMessageCorrelationTests(unittest.TestCase):
+    """WeChat hard-links a repeated document under a new '(n)' name, so every
+    copy carries the mtime of the first materialization. Correlation has to key
+    on the file name, not on a time window around that mtime."""
+
+    def _build_index(self, tmp_dir: str, rows: list[tuple[int, str, int, str]]) -> Path:
+        merge_path = Path(tmp_dir) / "merge.db"
+        conn = sqlite3.connect(str(merge_path))
+        try:
+            conn.execute(
+                "CREATE TABLE MSG(MsgSvrID INTEGER, StrTalker TEXT, CreateTime INTEGER,"
+                " Type INTEGER, BytesExtra BLOB)"
+            )
+            conn.executemany(
+                "INSERT INTO MSG(MsgSvrID, StrTalker, CreateTime, Type, BytesExtra) VALUES(?,?,?,49,?)",
+                [(svr, talker, ts, rel.encode("utf-8")) for svr, talker, ts, rel in rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return merge_path
+
+    def _build_resolver(self, merge_path: Path) -> WeChatDBResolver:
+        resolver = WeChatDBResolver.__new__(WeChatDBResolver)
+        resolver.wechat_root = None
+        resolver.merge_path = merge_path
+        resolver._decode_bytes_extra = lambda be: {"3": [{"1": "4", "2": bytes(be).decode("utf-8")}]}
+        resolver.refresh_if_due = lambda force=False: True
+        return resolver
+
+    def test_finds_the_message_for_a_hard_linked_copy(self) -> None:
+        base = "wxid_x\\FileStorage\\File\\2026-07\\Bradesco 22500,00 AMD"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            merge_path = self._build_index(
+                tmp_dir,
+                [
+                    (11, "grupo_a@chatroom", 1785173690, f"{base}.(1).pdf"),
+                    (22, "grupo_b@chatroom", 1785182400, f"{base}..pdf"),
+                    (33, "grupo_c@chatroom", 1785241566, f"{base}.(2).pdf"),
+                ],
+            )
+            resolver = self._build_resolver(merge_path)
+
+            # The copy whose message is 15h *after* the shared inode mtime.
+            found = resolver.find_file_message_by_name(Path(f"C:/wx/{Path(base).name}.(2).pdf"))
+            self.assertIsNotNone(found)
+            self.assertEqual(found.talker, "grupo_c@chatroom")
+            self.assertEqual(found.msg_svr_id, "33")
+
+            # The unsuffixed name must not match the "(1)"/"(2)" copies.
+            found = resolver.find_file_message_by_name(Path(f"C:/wx/{Path(base).name}..pdf"))
+            self.assertIsNotNone(found)
+            self.assertEqual(found.talker, "grupo_b@chatroom")
+
+    def test_returns_none_when_the_file_has_no_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            merge_path = self._build_index(
+                tmp_dir, [(11, "grupo_a@chatroom", 1785173690, "wxid_x\\FileStorage\\File\\2026-07\\outro.pdf")]
+            )
+            resolver = self._build_resolver(merge_path)
+            self.assertIsNone(resolver.find_file_message_by_name(Path("C:/wx/orfao.pdf")))
+
+
+class StalePdfModifyTests(unittest.TestCase):
+    def _pdf(self, tmp_dir: str, age_seconds: float) -> Path:
+        path = Path(tmp_dir) / "comprovante.pdf"
+        path.write_bytes(b"%PDF-1.4")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_recent_pdf_modify_is_processed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.assertFalse(is_stale_pdf_modify(self._pdf(tmp_dir, 60)))
+
+    def test_old_pdf_modify_is_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.assertTrue(is_stale_pdf_modify(self._pdf(tmp_dir, 5 * 24 * 3600)))
+
+    def test_non_pdf_is_never_filtered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "img.dat"
+            path.write_bytes(b"x")
+            stamp = time.time() - 5 * 24 * 3600
+            os.utime(path, (stamp, stamp))
+            self.assertFalse(is_stale_pdf_modify(path))
 
 
 class OpeningOrderCommitGateTests(unittest.TestCase):
@@ -1790,6 +1951,336 @@ class ReceiptBackfillTests(unittest.TestCase):
                 self.assertEqual(sink.updated_rows, [])
             finally:
                 db.close()
+
+
+class GluedZeroCentFixTests(unittest.TestCase):
+    """Glued BRL tokens ending in "00" must split cents like any other.
+
+    Real regression 29/07/2026: Nubank "R$ 700,00" was OCR'd as "R$70000" and
+    committed to the sheet as R$ 70.000,00 (client 991, user-confirmed).
+    """
+
+    def _nubank_text(self, valor_line: str) -> str:
+        return "\n".join(
+            [
+                "Comprovantede",
+                "transferencia",
+                "29JUL2026-06:50:37",
+                "Valor",
+                valor_line,
+                "Tipodetransferencia",
+                "Pix",
+                "E182361202026072",
+                "IDdatransacao",
+                "90949s0963991599",
+                "Destino",
+                "Nome",
+                "CLEENDELETRONICOS",
+                "CNPJ",
+                "61964978000168",
+                "Instituicao",
+                "BCOBRADESCOS.A.",
+                "Chave Pix",
+                "+5511976266666",
+                "Origem",
+                "Nome",
+                "MirtesdaSilva Lucena",
+                "Instituicao",
+                "NUPAGAMENTOS-IP",
+                "CPF",
+                ".256.092-.",
+            ]
+        )
+
+    def test_five_digit_glued_ending_00_splits_cents(self) -> None:
+        fields = parse_receipt_fields(self._nubank_text("R$70000"), ocr_conf=0.84, q_score=0.9)
+        self.assertEqual(fields["amount"], 700.0)
+        self.assertEqual(fields["amount_rounded"], 700.0)
+        self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
+
+    def test_other_glued_00_values_from_the_same_day(self) -> None:
+        fields16 = parse_receipt_fields(self._nubank_text("R$16000"), ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields16["amount"], 160.0)
+        fields95 = parse_receipt_fields(self._nubank_text("R$95000"), ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields95["amount"], 950.0)
+
+    def test_four_digit_glued_ending_00_splits_cents(self) -> None:
+        fields = parse_receipt_fields(self._nubank_text("R$6600"), ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields["amount"], 66.0)
+        self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
+
+    def test_seven_digit_fully_glued_thousands_and_cents(self) -> None:
+        # "16.000,00" with every separator dropped -> "1600000".
+        fields = parse_receipt_fields(self._nubank_text("R$1600000"), ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields["amount"], 16000.0)
+        self.assertEqual(fields["amount_source"], "currency_compact_cent_fix")
+
+    def test_eight_digit_glued_token_is_never_guessed(self) -> None:
+        fields = parse_receipt_fields(self._nubank_text("R$12345678"), ocr_conf=0.9, q_score=0.9)
+        self.assertIsNone(fields["amount"])
+        self.assertEqual(fields["amount_source"], "missing")
+
+    def test_separator_bearing_values_are_untouched(self) -> None:
+        fields = parse_receipt_fields(self._nubank_text("R$30.000,00"), ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields["amount"], 30000.0)
+        self.assertEqual(fields["amount_source"], "currency")
+
+    def test_compact_cent_fix_tints_row_value_uncertain(self) -> None:
+        from wechat_receipt_daemon import build_sheet_payload_from_receipt
+
+        payload = build_sheet_payload_from_receipt(
+            {
+                "file_id": "f1",
+                "client": "991",
+                "amount": 700.0,
+                "amount_rounded": 700.0,
+                "amount_source": "currency_compact_cent_fix",
+                "verification_status": "CONFIRMADO",
+            }
+        )
+        self.assertTrue(payload["value_uncertain"])
+
+
+class MaskedCpfNeverAmountTests(unittest.TestCase):
+    """Masked payer documents must never be parsed as the transfer value.
+
+    Real regression 29/07/2026 (client 991, sheet rows 229/232/236): Nubank
+    bottom-half prints carried no "Valor" line and the masked CPF
+    "...109.153-.." / "...756.313-.." was committed as R$ 109.153,00 /
+    R$ 756.313,00.
+    """
+
+    def _nubank_bottom_half(self, cpf_line: str) -> str:
+        return "\n".join(
+            [
+                "13:34",
+                "l5G",
+                "Nome",
+                "CLEENDELETRONICOS",
+                "CNPJ",
+                "61964978000168",
+                "Instituicao",
+                "BCOBRADESCOS.A.",
+                "Chave Pix",
+                "+5511976266666",
+                "Origem",
+                "Nome",
+                "Stephanya Kariny Alves deLima",
+                "Instituicao",
+                "NUPAGAMENTOS-IP",
+                "CPF",
+                cpf_line,
+                "Nu Pagamentos S.A.-Instituicao de Pagamento",
+            ]
+        )
+
+    def test_masked_cpf_with_leading_dots_is_not_an_amount(self) -> None:
+        fields = parse_receipt_fields(self._nubank_bottom_half("...109.153-.."), ocr_conf=0.9, q_score=0.9)
+        self.assertIsNone(fields["amount"])
+        self.assertEqual(fields["amount_source"], "missing")
+
+    def test_masked_cpf_variant_is_not_an_amount(self) -> None:
+        fields = parse_receipt_fields(self._nubank_bottom_half("...756.313-.."), ocr_conf=0.9, q_score=0.9)
+        self.assertIsNone(fields["amount"])
+
+    def test_bottom_half_is_flagged_as_sender_continuation(self) -> None:
+        from wechat_receipt_daemon import looks_like_sender_continuation
+
+        self.assertTrue(looks_like_sender_continuation(self._nubank_bottom_half("...109.153-..")))
+
+
+class ContinuationDetectionTests(unittest.TestCase):
+    def test_tiny_glued_strip_is_a_fragment(self) -> None:
+        from wechat_receipt_daemon import looks_like_receipt_fragment
+
+        # Real regression 29/07/2026 (client 116A, sheet row 320): a 24-char
+        # thumbnail strip was committed as a receipt with an empty value.
+        self.assertTrue(looks_like_receipt_fragment("427/07/202614:05AMD47500"))
+
+    def test_receipts_and_valued_strips_are_not_fragments(self) -> None:
+        from wechat_receipt_daemon import looks_like_receipt_fragment
+
+        self.assertFalse(looks_like_receipt_fragment("Valor do pagamento\nRS185,00\nPix"))
+        self.assertFalse(looks_like_receipt_fragment("Comprovante de Pix\n29/julho/2026"))
+        self.assertFalse(looks_like_receipt_fragment("27/07/2026 AMD R$ 475,00"))
+        self.assertFalse(looks_like_receipt_fragment(""))
+
+    def test_bb_bottom_half_without_origem_is_continuation(self) -> None:
+        from wechat_receipt_daemon import looks_like_sender_continuation
+
+        # Real regression 29/07/2026 (client 991, sheet row 234): the Banco do
+        # Brasil bottom half labels the sender with CPF/Agencia/Conta and never
+        # uses "Origem"/"Pagador"/"Remetente".
+        parte2 = "\n".join(
+            [
+                "14:12#S0",
+                "Carlos Eduardo Vieira",
+                "CPF",
+                "***951.393-**",
+                "Agencia",
+                "0124-4",
+                "Conta",
+                "136585-1",
+                "Instituicao",
+                "OOOOOOOO BCODOBRASILS.A.",
+                "Informagoesadicionais",
+                "ID:E0000000020260729171113822721627",
+                "Recebeuum comprovante e",
+                "ficou na duvida?",
+            ]
+        )
+        self.assertTrue(looks_like_sender_continuation(parte2))
+        fields = parse_receipt_fields(parte2, ocr_conf=0.9, q_score=0.9)
+        self.assertIsNone(fields["amount"])
+
+    def test_full_receipt_header_blocks_the_sender_label_branch(self) -> None:
+        from wechat_receipt_daemon import looks_like_sender_continuation
+
+        # A full receipt whose "Valor" line was lost still opens with the
+        # "Comprovante de ..." header; it must NOT be silently skipped.
+        text = "\n".join(
+            [
+                "Comprovante de transferencia",
+                "CPF",
+                "12345678900",
+                "Agencia",
+                "1234",
+                "Conta",
+                "56789-0",
+                "Instituicao",
+                "BCO EXEMPLO S.A.",
+            ]
+        )
+        self.assertFalse(looks_like_sender_continuation(text))
+
+    def test_full_pagbank_receipt_is_neither_fragment_nor_continuation(self) -> None:
+        from wechat_receipt_daemon import (
+            looks_like_receipt_fragment,
+            looks_like_sender_continuation,
+        )
+
+        # Committed correctly at row 319 the same minute as the 116A strip --
+        # it must keep passing untouched.
+        text = "\n".join(
+            [
+                "Valor do pagamento",
+                "RS185,00",
+                "Tipodetransferencia",
+                "Pix",
+                "De",
+                "Wellington Miranda Pinto",
+                "CPF",
+                "***721.657-**",
+                "Instituicao",
+                "PagBank(PagSeguroInternet",
+            ]
+        )
+        self.assertFalse(looks_like_receipt_fragment(text))
+        self.assertFalse(looks_like_sender_continuation(text))
+        fields = parse_receipt_fields(text, ocr_conf=0.9, q_score=0.9)
+        self.assertEqual(fields["amount"], 185.0)
+
+
+class NoAmountNeverCommitsTests(unittest.TestCase):
+    def test_amountless_parse_is_never_staged(self) -> None:
+        from wechat_receipt_daemon import should_stage_receipt
+
+        fields = parse_receipt_fields("427/07/202614:05AMD47500", ocr_conf=0.9, q_score=0.5)
+        self.assertIsNone(fields["amount"])
+        self.assertFalse(should_stage_receipt(fields))
+
+    def test_valued_receipt_is_staged_even_without_bank_or_time(self) -> None:
+        from wechat_receipt_daemon import should_stage_receipt
+
+        fields = parse_receipt_fields("Valor do pagamento\nRS185,00\nPix", ocr_conf=0.9, q_score=0.5)
+        self.assertEqual(fields["amount"], 185.0)
+        self.assertTrue(should_stage_receipt(fields))
+
+    def test_sink_choke_point_skips_amountless_row_terminally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                db.insert_receipt(
+                    build_receipt_payload(
+                        file_id="no-amount",
+                        ingested_at=2100.0,
+                        msg_svr_id="no-amount-msg",
+                        msg_create_time=400.0,
+                        amount=None,
+                        amount_rounded=None,
+                    )
+                )
+                insert_file_row(
+                    db,
+                    file_id="no-amount",
+                    path="C:/fake/no-amount.dat",
+                    source_kind="msgattach_image_dat",
+                    status="done",
+                    first_seen=2000.0,
+                    last_error=None,
+                )
+
+                claimed = db.claim_next_sink_receipt()
+                self.assertIsNotNone(claimed)
+                self.assertIsNone(claimed["row_payload"].get("amount"))
+
+                db.mark_receipt_sink_skipped_terminal(str(claimed["file_id"]), note="NO_AMOUNT_GUARD")
+
+                self.assertIsNone(db.claim_next_sink_receipt())
+                row = db._conn.execute(
+                    "SELECT sheet_status, sheet_last_error FROM receipts WHERE file_id='no-amount'"
+                ).fetchone()
+                self.assertEqual(row["sheet_status"], "SINK_SKIPPED_TERMINAL")
+                self.assertEqual(row["sheet_last_error"], "NO_AMOUNT_GUARD")
+            finally:
+                db.close()
+
+
+class MergeSwapRetryTests(unittest.TestCase):
+    def test_swap_retries_while_a_reader_holds_the_index(self) -> None:
+        # Real regression 29/07/2026: one WinError 32 during the swap (a reader
+        # connection held wechat_merge.db open) wedged the index for 12h. The
+        # swap must retry until the reader lets go, then clear the error.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = WeChatDBResolverMergeRunnerTests._build_resolver(self, tmp_dir)
+            resolver.merge_path.write_text("old", encoding="utf-8")
+
+            def fake_merge(target_path) -> tuple[bool, str]:
+                target_path.write_text("new", encoding="utf-8")
+                return True, "ok"
+
+            resolver._merge_real_time_db_with_timeout_path = fake_merge
+            resolver._merge_seq = 1
+
+            holder = open(resolver.merge_path, "rb")
+            releaser = threading.Timer(1.2, holder.close)
+            releaser.start()
+            try:
+                resolver._run_background_merge(started_at=100.0, force=False, seq=1)
+            finally:
+                releaser.cancel()
+                if not holder.closed:
+                    holder.close()
+
+            self.assertEqual(resolver.merge_path.read_text(encoding="utf-8"), "new")
+            self.assertIsNone(resolver.last_error)
+            self.assertEqual(resolver._last_failure, 0.0)
+
+    def test_superseded_attempt_never_overwrites_a_newer_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            resolver = WeChatDBResolverMergeRunnerTests._build_resolver(self, tmp_dir)
+            resolver.merge_path.write_text("newer", encoding="utf-8")
+
+            def fake_merge(target_path) -> tuple[bool, str]:
+                target_path.write_text("stale", encoding="utf-8")
+                return True, "ok"
+
+            resolver._merge_real_time_db_with_timeout_path = fake_merge
+            resolver._merge_seq = 5  # a newer attempt already started
+
+            resolver._run_background_merge(started_at=100.0, force=False, seq=4)
+
+            self.assertEqual(resolver.merge_path.read_text(encoding="utf-8"), "newer")
 
 
 if __name__ == "__main__":

@@ -114,6 +114,36 @@ MANUAL_SESSION_FILE_HOLD_PREFIXES = (
     "WAITING_PRIOR_SINK_RECEIPT:",
 )
 
+# How long a PDF may wait for its Type=49 message before we give up on it.
+# Only counted while the message index is known to be current -- see
+# process_item(); a stale index must never cause a receipt to be dropped.
+PDF_ORPHAN_GRACE_SECONDS = 600
+# Held attempts before a correlated PDF whose group is not in the client map is
+# published with client "-".
+PDF_CORRELATION_GRACE_ATTEMPTS = 5
+# A modify event on a PDF this old is noise (indexer, AV scan). A genuine WeChat
+# re-download arrives as a *create* event, because WeChat hard-links a new
+# "(n)" name instead of rewriting the file.
+STALE_PDF_MODIFY_SECONDS = 24 * 3600
+# Report the message index as stale once no merge has landed for this long.
+INDEX_STALE_WARN_SECONDS = 300
+
+
+def is_stale_pdf_modify(path: Path) -> bool:
+    """True for a modify event on a PDF old enough to be background noise.
+
+    WeChat never rewrites a downloaded PDF -- a re-received document is a new
+    hard link, which arrives as a *create* event. So a modify event on an old
+    PDF comes from an indexer or AV scan, and acting on it replays the whole
+    FileStorage\\File archive into the queue.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False
+    try:
+        return (time.time() - path.stat().st_mtime) > STALE_PDF_MODIFY_SECONDS
+    except OSError:
+        return True
+
 
 def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     if not path.is_file():
@@ -180,9 +210,24 @@ def hold_retry_delay_seconds(now: float, deadline: float, minimum: int = 2, maxi
 def runtime_media_resolver(media_resolver: Optional["WeChatDBResolver"]) -> Optional["WeChatDBResolver"]:
     if media_resolver is None:
         return None
-    if media_resolver.last_error:
-        return None
-    return media_resolver
+    err = media_resolver.last_error
+    if not err:
+        return media_resolver
+    # A failed merge/swap leaves the on-disk index STALE but still queryable,
+    # and querying is what triggers refresh_if_due() -> the retry that clears
+    # the error. Gating on these errors created a permanent livelock (29/07:
+    # one WinError 32 at 10:42 froze the index, and every PDF, for 12h).
+    # Only errors that mean there is no usable index disable the resolver.
+    stale_index_errors = (
+        "rename_failed:",
+        "superseded_by_newer_attempt",
+        "merge_failed:",
+        "merge_stalled:",
+        "bg_merge_exception:",
+    )
+    if err.startswith(stale_index_errors) and media_resolver.merge_path.exists():
+        return media_resolver
+    return None
 
 
 def candidate_initial_delay_seconds(source_kind: str, settle_seconds: int, thumb_candidates_enabled: bool) -> int:
@@ -1115,7 +1160,36 @@ def looks_like_sender_continuation(text: str) -> bool:
     low = strip_accents(str(text or "").lower())
     if "valor" in low:
         return False
-    return any(token in low for token in ("origem", "pagador", "remetente"))
+    if any(token in low for token in ("origem", "pagador", "remetente")):
+        return True
+    # BB/Bradesco bottom halves label the sender with account fields instead of
+    # an "Origem" header. A full receipt always opens with "Comprovante de ..."
+    # (the BB footer "Recebeu um comprovante e ficou na duvida?" does not match).
+    compact = re.sub(r"\s+", "", low)
+    if "comprovantede" in compact:
+        return False
+    sender_labels = sum(
+        1 for token in ("cpf", "agencia", "conta", "instituicao", "autenticacao") if token in compact
+    )
+    return sender_labels >= 2
+
+
+def looks_like_receipt_fragment(text: str) -> bool:
+    """A tiny OCR strip (date/time/bank glued digits) -- never a standalone receipt.
+
+    Real regression: a 24-char thumbnail strip "427/07/202614:05AMD47500"
+    (client 116A) carries no header, no amount pattern and no receipt keyword,
+    yet survives looks_like_single_receipt (a blacklist) and detect_bank.
+    """
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact or len(compact) > 60:
+        return False
+    low = strip_accents(compact.lower())
+    if any(token in low for token in ("comprovante", "recibo", "valor", "pix")):
+        return False
+    if AMOUNT_CURRENCY_PATTERN.search(text) or AMOUNT_FALLBACK_PATTERN.search(text):
+        return False
+    return True
 
 
 def _receipt_anchor_norm(text: str) -> str:
@@ -1264,9 +1338,12 @@ def should_apply_compact_cent_fix(raw_value: str, currency: Optional[str], conte
         return False
     if currency != "BRL":
         return False
-    if len(digits) < 4 or len(digits) > 6:
-        return False
-    if digits.endswith("00"):
+    # Tokens ending in "00" are NOT exempt: every layout except Mercado Pago
+    # prints cents (~99% of 17k historical receipts), so "R$70000" is "R$ 700,00"
+    # with the comma dropped, not a round R$ 70.000. Seven digits covers a fully
+    # glued thousands value ("16.000,00" -> "1600000"). Every reconstruction is
+    # review-flagged and tinted on the sheet.
+    if len(digits) < 4 or len(digits) > 7:
         return False
     return any(token in context_low for token in COMPACT_AMOUNT_CONTEXT_HINTS)
 
@@ -1386,6 +1463,10 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                     source = compact_source
             if value is None:
                 continue
+            # A glued token of 8+ digits is beyond safe reconstruction (would be
+            # >= R$ 100.000,00); leave the amount missing for review, never guess.
+            if "." not in raw_value and "," not in raw_value and len(re.sub(r"\D", "", raw_value)) >= 8:
+                continue
             after_char = line[m.end(2):m.end(2) + 1]
             if after_char == "/":
                 continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
@@ -1420,6 +1501,13 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 continue  # year glued to an hour ("2026,18:10:54") is date/time noise
             if before_char == "*" or after_char == "*":
                 continue  # masked document or Pix key ("**9.762.666-**"), not an amount
+            if after_char == "-":
+                continue  # masked CPF/CNPJ ("...109.153-..") or account nr ("33.055-8"), not an amount
+            if before_char == "." and not re.search(r"[.,]\d{2}$", raw_value):
+                continue  # masked CPF chunk (".256.092"); real values after a dot keep
+                # their two cent digits ("RS.61.10", "R$.820,00" on Caixa/Inter layouts)
+            if "cpf" in prev_low or "cnpj" in prev_low or "cpf" in line_low or "cnpj" in line_low:
+                continue  # a number under a document label is never the value
             if after_char == ".":
                 continue  # filename/document continuation ("17.06.26.pdf", "….034.52.005")
             followed_by_letter = after_char.isalpha()
@@ -1577,6 +1665,11 @@ def compute_review_needed(
     )
 
 
+def should_stage_receipt(fields: dict[str, Any]) -> bool:
+    """A parse with no readable amount must never be staged for the sheet."""
+    return fields.get("amount") is not None
+
+
 def build_sheet_payload_from_receipt(
     receipt_payload: dict[str, Any],
     existing_payload: Optional[dict[str, Any]] = None,
@@ -1604,10 +1697,11 @@ def build_sheet_payload_from_receipt(
             "value_uncertain": bool(
                 receipt_payload.get("amount") is None
                 or receipt_payload.get("amount_source") == "fallback"
-                # Glued Mercado Pago superscript cents are reconstructed by
-                # splitting digits; the split is occasionally ambiguous
-                # ("8374": 83,74 vs 837,4x), so tint for a quick human check.
+                # Glued-digit cents are reconstructed by splitting the last two
+                # digits; the split is occasionally ambiguous ("8374": 83,74 vs
+                # 837,4x; "70000": 700,00 vs 70.000), so tint for a human check.
                 or receipt_payload.get("amount_source") == "currency_superscript_cent_fix"
+                or receipt_payload.get("amount_source") == "currency_compact_cent_fix"
             ),
             # Tints the row blue on the sheet so PDF receipts are recognizable.
             "is_pdf": receipt_payload.get("source_kind") == "file_pdf",
@@ -1767,6 +1861,15 @@ class WeChatDBResolver:
         self._lock = threading.Lock()
         self._merge_thread: Optional[threading.Thread] = None
         self._merge_thread_lock = threading.Lock()
+        self._merge_started_at = 0.0
+        self._merge_seq = 0
+        # A merge thread that never returns used to freeze the message index
+        # indefinitely: is_alive() short-circuits every later attempt and no log
+        # line is ever emitted, so client attribution silently degrades while
+        # the daemon looks healthy. Past this many seconds the attempt is
+        # declared wedged and a fresh one is allowed through.
+        self.merge_stall_seconds = 300
+        self._newest_msg_cache: tuple[float, float] = (0.0, 0.0)  # (merge_mtime, newest_create_time)
         self._load_dependencies()
         self._load_account_info(force=True)
 
@@ -1777,6 +1880,34 @@ class WeChatDBResolver:
     @property
     def last_error(self) -> Optional[str]:
         return self._last_error
+
+    @property
+    def last_successful_refresh(self) -> float:
+        """Wall clock of the last merge that actually replaced the index."""
+        return self._last_refresh
+
+    def newest_message_time(self) -> float:
+        """CreateTime of the newest message in the local index (0 if unknown)."""
+        try:
+            merge_mtime = self.merge_path.stat().st_mtime
+        except OSError:
+            return 0.0
+        cached_mtime, cached_value = self._newest_msg_cache
+        if cached_mtime == merge_mtime:
+            return cached_value
+        try:
+            conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
+        except Exception:
+            return 0.0
+        try:
+            row = conn.execute("SELECT MAX(CreateTime) FROM MSG").fetchone()
+            value = float(row[0] or 0.0) if row is not None else 0.0
+        except Exception:
+            return 0.0
+        finally:
+            conn.close()
+        self._newest_msg_cache = (merge_mtime, value)
+        return value
 
     @property
     def selected_wx_dir(self) -> Optional[Path]:
@@ -2008,7 +2139,9 @@ class WeChatDBResolver:
 
         decrypted: list[Path] = []
         for shard in shards:
-            out = target_path.parent / f"de_{shard.stem.lower()}.db"
+            # Scoped to target_path so two overlapping merge attempts never
+            # decrypt into the same intermediate file.
+            out = target_path.with_name(f"de_{shard.stem.lower()}_{target_path.name}")
             code, detail = self._decrypt_db_with_wal(shard, out)
             if not code:
                 return False, f"{shard.name}:{detail}"
@@ -2105,10 +2238,12 @@ class WeChatDBResolver:
         self._last_error = detail
         return False
 
-    def _run_background_merge(self, started_at: float, force: bool) -> None:
+    def _run_background_merge(self, started_at: float, force: bool, seq: int = 0) -> None:
         try:
             self.merge_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_merge_path = self.merge_path.with_suffix(".db.tmp")
+            # One tmp file per attempt: a wedged attempt that wakes up later must
+            # not write into the file the current attempt is building.
+            tmp_merge_path = self.merge_path.with_suffix(f".db.tmp{seq or ''}")
             if tmp_merge_path.exists():
                 try:
                     tmp_merge_path.unlink()
@@ -2117,19 +2252,48 @@ class WeChatDBResolver:
 
             code, ret = self._merge_real_time_db_with_timeout_path(tmp_merge_path)
 
+            swapped = False
+            swap_err = ""
+            if code:
+                if seq and seq != self._merge_seq:
+                    # A newer attempt superseded this one while it ran; its
+                    # output must not overwrite the newer index.
+                    swap_err = "superseded_by_newer_attempt"
+                else:
+                    # os.replace is atomic and overwrites in place. A concurrent
+                    # reader connection makes Windows refuse the swap (WinError
+                    # 32), so retry briefly OUTSIDE self._lock -- one refused
+                    # swap must degrade freshness, never wedge the pipeline.
+                    for _ in range(10):
+                        try:
+                            os.replace(tmp_merge_path, self.merge_path)
+                            swapped = True
+                            break
+                        except FileNotFoundError as exc:
+                            # The tmp is gone (superseded attempt cleaned it up);
+                            # retrying cannot succeed.
+                            swap_err = f"rename_failed:{type(exc).__name__}:{exc}"
+                            break
+                        except OSError as exc:
+                            swap_err = f"rename_failed:{type(exc).__name__}:{exc}"
+                            time.sleep(0.5)
+
             with self._lock:
                 if code:
-                    try:
-                        if self.merge_path.exists():
-                            self.merge_path.unlink()
-                        tmp_merge_path.rename(self.merge_path)
+                    if swapped:
                         if self._last_error is not None:
                             print(f"[RESOLVER] merge recuperado ({ret})")
                         self._last_refresh = time.time()
                         self._last_failure = 0.0
                         self._last_error = None
-                    except Exception as exc:
-                        self._mark_refresh_failure(time.time(), f"rename_failed:{type(exc).__name__}:{exc}")
+                    else:
+                        print(f"[RESOLVER] swap_falhou: {swap_err[:200]}")
+                        self._mark_refresh_failure(time.time(), swap_err)
+                        try:
+                            if tmp_merge_path.exists():
+                                tmp_merge_path.unlink()
+                        except Exception:
+                            pass
                 else:
                     # A failed merge silently degrades every downstream feature
                     # (client attribution, msg dedup, ordering) -- make it visible.
@@ -2157,15 +2321,24 @@ class WeChatDBResolver:
 
             with self._merge_thread_lock:
                 if self._merge_thread is not None and self._merge_thread.is_alive():
-                    return self.merge_path.exists()
+                    running_for = now - self._merge_started_at
+                    if running_for < self.merge_stall_seconds:
+                        return self.merge_path.exists()
+                    # Wedged: say so out loud and let a fresh attempt through.
+                    # Flagging the error also degrades the resolver to
+                    # path-only, so nothing is attributed from a frozen index.
+                    print(f"[RESOLVER] merge_travado | rodando_ha={running_for:.0f}s | nova tentativa")
+                    self._last_error = f"merge_stalled:{running_for:.0f}s"
 
                 if not self._load_account_info(force=force):
                     self._last_failure = now
                     return self.merge_path.exists()
 
+                self._merge_seq += 1
+                self._merge_started_at = now
                 self._merge_thread = threading.Thread(
                     target=self._run_background_merge,
-                    args=(now, force),
+                    args=(now, force, self._merge_seq),
                     daemon=True
                 )
                 self._merge_thread.start()
@@ -2232,7 +2405,7 @@ class WeChatDBResolver:
 
         lower = max(0, int(pivot_ts) - max(5, int(lookback_sec)))
         upper = int(pivot_ts) + max(1, int(lookahead_sec))
-        conn = sqlite3.connect(str(self.merge_path))
+        conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -2321,7 +2494,7 @@ class WeChatDBResolver:
             return []
         lower = max(0, int(pivot_ts) - max(5, int(lookback_sec)))
         upper = int(pivot_ts) + max(1, int(lookahead_sec))
-        conn = sqlite3.connect(str(self.merge_path))
+        conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -2343,27 +2516,82 @@ class WeChatDBResolver:
             file_rel = self._extract_attached_file_path(row["BytesExtra"])
             if not file_rel:
                 continue
-            out.append(
-                WeChatMessageRef(
-                    msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
-                    talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
-                    create_time=float(row["CreateTime"]),
-                    sender_user_name=None,
-                    sender_display=None,
-                    image_rel_path=file_rel,
-                    thumb_rel_path=None,
-                    image_abs_path=self._absolute_path_from_rel(file_rel),
-                    thumb_abs_path=None,
-                )
-            )
+            out.append(self._message_ref_from_file_row(row, file_rel))
         return out
 
-    def find_file_message_for_path(self, path: Path, pivot_ts: float) -> Optional[WeChatMessageRef]:
-        """Match an attachment file (e.g. a receipt PDF) to its Type=49 message.
+    def _message_ref_from_file_row(self, row: sqlite3.Row, file_rel: str) -> WeChatMessageRef:
+        return WeChatMessageRef(
+            msg_svr_id=str(row["MsgSvrID"]) if row["MsgSvrID"] is not None else None,
+            talker=str(row["StrTalker"]) if row["StrTalker"] is not None else None,
+            create_time=float(row["CreateTime"]),
+            sender_user_name=None,
+            sender_display=None,
+            image_rel_path=file_rel,
+            thumb_rel_path=None,
+            image_abs_path=self._absolute_path_from_rel(file_rel),
+            thumb_abs_path=None,
+        )
 
-        Users download a PDF minutes after the message arrives (file mtime =
-        download time), so the lookback is much wider than for auto-saved images.
+    def find_file_message_by_name(self, path: Path) -> Optional[WeChatMessageRef]:
+        """Find the Type=49 message that produced this attachment, by file name.
+
+        WeChat never rewrites a downloaded file: when the same document is
+        received again it hard-links a new "Name(n).pdf" onto the same inode.
+        Every copy therefore reports the mtime of the *first* materialization,
+        which can be hours or days before the message that created the copy --
+        so no time window around the mtime can find it.
+
+        BytesExtra stores the exact final path including the "(n)" suffix, so
+        the file name is an unambiguous key and no time window is needed.
         """
+        if not self.refresh_if_due():
+            return None
+        if not self.merge_path.exists():
+            return None
+        needle = path.name.encode("utf-8", "ignore")
+        if not needle:
+            return None
+
+        conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                FROM MSG
+                WHERE Type=49
+                  AND instr(CAST(BytesExtra AS BLOB), ?) > 0
+                ORDER BY CreateTime DESC
+                LIMIT 20
+                """,
+                (needle,),
+            ).fetchall()
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+        target = normalize_windows_text(path.name)
+        for row in rows:
+            file_rel = self._extract_attached_file_path(row["BytesExtra"])
+            if not file_rel:
+                continue
+            # instr() matched raw bytes; confirm it was the file name and not a
+            # longer name that happens to contain it.
+            if normalize_windows_text(PureWindowsPath(file_rel).name) != target:
+                continue
+            return self._message_ref_from_file_row(row, file_rel)
+        return None
+
+    def find_file_message_for_path(self, path: Path, pivot_ts: float) -> Optional[WeChatMessageRef]:
+        """Match an attachment file (e.g. a receipt PDF) to its Type=49 message."""
+        by_name = self.find_file_message_by_name(path)
+        if by_name is not None:
+            return by_name
+
+        # Fallback for names the index stores differently: users download a PDF
+        # minutes after the message arrives (file mtime = download time), so the
+        # lookback is much wider than for auto-saved images.
         path_norms = self._candidate_norms(path)
         for msg in self._recent_file_messages(pivot_ts, lookback_sec=6 * 3600, lookahead_sec=120, limit=200):
             msg_paths = {normalize_windows_text(msg.image_rel_path)} if msg.image_rel_path else set()
@@ -2411,7 +2639,7 @@ class WeChatDBResolver:
         if not self.merge_path.exists():
             return []
 
-        conn = sqlite3.connect(str(self.merge_path))
+        conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
             rows = conn.execute(
@@ -2455,23 +2683,34 @@ class WeChatDBResolver:
             return None
         if not self.refresh_if_due():
             return username
-        if not self.merge_path.exists():
+
+        # Contact lives in the side-car contacts db, not in the MSG merge.
+        # A display name is cosmetic: any lookup problem (missing db, missing
+        # table, locked file) must degrade to the raw username, never fail the
+        # receipt -- "no such table: Contact" used to RETRY-loop every image.
+        contacts_path = self.merge_path.with_name("wechat_merge_contacts.db")
+        db_path = contacts_path if contacts_path.exists() else self.merge_path
+        if not db_path.exists():
             return username
 
-        conn = sqlite3.connect(str(self.merge_path))
-        conn.row_factory = sqlite3.Row
+        row = None
         try:
-            row = conn.execute(
-                """
-                SELECT Remark, NickName, Alias
-                FROM Contact
-                WHERE UserName=?
-                LIMIT 1
-                """,
-                (username,),
-            ).fetchone()
-        finally:
-            conn.close()
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    """
+                    SELECT Remark, NickName, Alias
+                    FROM Contact
+                    WHERE UserName=?
+                    LIMIT 1
+                    """,
+                    (username,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return username
 
         if row is None:
             return username
@@ -4151,6 +4390,22 @@ class StateDB:
             )
             self._conn.commit()
 
+    def mark_receipt_sink_skipped_terminal(self, file_id: str, note: str) -> None:
+        # Terminal, never retry: a non-terminal status would be re-claimed
+        # forever and block same-talker ordering behind it.
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE receipts
+                SET sheet_status='SINK_SKIPPED_TERMINAL',
+                    sheet_next_attempt=0,
+                    sheet_last_error=?
+                WHERE file_id=?
+                """,
+                (str(note)[:1200], str(file_id)),
+            )
+            self._conn.commit()
+
     def mark_receipt_sink_retry(self, file_id: str, err: str, delay_sec: int) -> None:
         next_attempt = time.time() + max(5, int(delay_sec))
         with self._lock:
@@ -5061,6 +5316,8 @@ class IngestEventHandler(FileSystemEventHandler):  # type: ignore[misc]
     def on_modified(self, event: Any) -> None:
         if event.is_directory:
             return
+        if is_stale_pdf_modify(Path(event.src_path)):
+            return
         file_id = self.db.upsert_candidate(
             Path(event.src_path),
             self.cfg.settle_seconds,
@@ -5923,10 +6180,31 @@ def process_item(
                 or gid == "9e20f478899dc29eb19741386f9343c8"
             )
             is_manual_open = (item.source_kind == "temp_image" or bool(item.manual_session_id))
-            # A PDF whose message correlation has not resolved after a few held
-            # attempts (~10 min) still gets launched, with client "-", instead of
-            # waiting forever.
-            is_pdf_after_grace = (item.source_kind == "file_pdf" and item.attempts >= 5)
+
+            if item.source_kind == "file_pdf" and resolution.msg_ref is None:
+                # An uncorrelated PDF must never reach the sheet: FileStorage\File
+                # holds every document ever downloaded, so publishing them with
+                # client "-" replays months of old receipts whenever something
+                # touches that folder. Only drop it once the index is known to
+                # have caught up -- a frozen index must not lose a receipt.
+                held_for = time.time() - float(item.first_seen or 0.0)
+                index_is_current = (
+                    active_media_resolver is not None
+                    and active_media_resolver.last_successful_refresh >= float(item.first_seen or 0.0)
+                )
+                if index_is_current and held_for >= PDF_ORPHAN_GRACE_SECONDS:
+                    db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="PDF_SEM_MENSAGEM")
+                    print(f"[SKIP] {path.name} | pdf_sem_mensagem_no_indice | esperou={held_for:.0f}s")
+                else:
+                    db.mark_hold(item.file_id, reason="WAITING_PDF_MESSAGE", delay_sec=120)
+                    print(f"[HOLD] {path.name} | aguardando_mensagem_do_pdf | indice_atual={index_is_current}")
+                return
+
+            # A correlated PDF whose group is not in the client map still gets
+            # launched, with client "-", instead of waiting forever.
+            is_pdf_after_grace = (
+                item.source_kind == "file_pdf" and item.attempts >= PDF_CORRELATION_GRACE_ATTEMPTS
+            )
             if is_file_transfer or is_manual_open or is_pdf_after_grace:
                 client = "-"
                 print(f"[INFO] {path.name} | grupo_sem_mapa={gid} mas prosseguindo (abertura manual/file_transfer)")
@@ -5953,6 +6231,17 @@ def process_item(
         #     db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
         #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
         #     return
+
+        # PDFs are the exception: a bank PDF is a fixed document, so identical
+        # bytes from the same client are the client re-sending the same receipt
+        # (WeChat hard-links it under a new "(n)" name every time), never two
+        # payments. Screenshots keep the behaviour above -- a client legitimately
+        # photographs the same screen twice.
+        if resolution.resolved_source_kind == "file_pdf" and db.receipt_sha_exists_other(digest, item.file_id, client):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="DUPLICATE_PDF_SHA")
+            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_PDF_SHA")
+            print(f"[DEDUP] {path.name} | pdf_identico_ja_lancado | cliente={client}")
+            return
 
         ocr_spans: Optional[list[OCRSpan]] = None
         if pdf_text is not None:
@@ -6145,20 +6434,34 @@ def process_item(
                     if own_ids & extract_pix_transaction_ids(r_text):
                         continuation_of = "mesmo_id_pix"
                         break
-            if continuation_of is None and looks_like_sender_continuation(text):
-                cutoff_short = time.time() - 300
-                for r_talker, r_client, r_text in db.find_recent_valued_receipts(since_ts=cutoff_short, limit=50):
-                    same_conv = (talker_now and r_talker == talker_now) or (
-                        client not in (None, "", "-") and r_client == client
-                    )
-                    if same_conv:
-                        continuation_of = "mesmo_grupo_sem_valor"
-                        break
+            if continuation_of is None:
+                is_sender_cont = looks_like_sender_continuation(text)
+                is_fragment = not is_sender_cont and looks_like_receipt_fragment(text)
+                if is_sender_cont or is_fragment:
+                    cutoff_short = time.time() - 300
+                    for r_talker, r_client, r_text in db.find_recent_valued_receipts(since_ts=cutoff_short, limit=50):
+                        same_conv = (talker_now and r_talker == talker_now) or (
+                            client not in (None, "", "-") and r_client == client
+                        )
+                        if same_conv:
+                            continuation_of = "mesmo_grupo_sem_valor" if is_sender_cont else "fragmento_sem_valor"
+                            break
             if continuation_of is not None:
                 db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note=f"CONTINUATION_PRINT:{continuation_of}")
                 db.mark_message_job_resolved(msg_svr_id, note=f"CONTINUATION_PRINT:{continuation_of}")
                 print(f"[SKIP] {path.name} | continuacao_do_comprovante_anterior ({continuation_of})")
                 return
+
+        if not should_stage_receipt(fields):
+            # No readable amount and no continuation match: surface it as a
+            # visible exception -- a row with an empty value must never reach
+            # the client sheet (regression: 116A strip and 991 BB bottom half
+            # were committed with amount=None on 29/07/2026).
+            db.mark_exception(item.file_id, reason="EXCEPTION_NO_AMOUNT")
+            db.set_meta("last_exception_reason", "EXCEPTION_NO_AMOUNT")
+            db.mark_message_job_exception(msg_svr_id, note="EXCEPTION_NO_AMOUNT")
+            print(f"[EXCEPTION] {path.name} | sem_valor_nunca_lancar | verification={resolution.verification_status}")
+            return
 
         if not has_core_signal(fields, bank):
             db.mark_exception(item.file_id, reason="EXCEPTION_MISSING_CORE_FIELDS")
@@ -6297,6 +6600,12 @@ def flush_ready_sink_rows(
         msg_create_time = float(claimed.get("msg_create_time") or 0.0)
         ingested_at = float(claimed.get("ingested_at") or 0.0)
         source_first_seen = float(claimed.get("source_first_seen") or 0.0)
+        if claimed["row_payload"].get("amount") is None:
+            # Choke-point guard: no row without a value ever reaches the sheet,
+            # whatever path staged it (historical SINK_PENDING rows included).
+            db.mark_receipt_sink_skipped_terminal(file_id, note="NO_AMOUNT_GUARD")
+            print(f"[SINK] skipped_no_amount | file_id={file_id} | msg={msg_svr_id} | talker={talker}")
+            continue
         try:
             sheet, row = sink.append(claimed["row_payload"], review_needed=bool(claimed["review_needed"]))
         except Exception as exc:
@@ -6816,6 +7125,19 @@ def main() -> int:
                 added = reconcile_scan(cfg, db)
                 last_reconcile = now
                 print(f"[SCAN] reconcile complete | queued_or_refreshed={added}")
+                if media_resolver is not None:
+                    # A silently frozen index degrades every client attribution,
+                    # so its age is reported alongside each reconcile.
+                    index_age = now - media_resolver.last_successful_refresh
+                    if media_resolver.last_successful_refresh <= 0 or index_age > INDEX_STALE_WARN_SECONDS:
+                        # Self-heal: actively kick a merge attempt (rate-limited
+                        # internally) instead of only logging -- query call sites
+                        # may all be gated off, and then nothing else retries.
+                        media_resolver.refresh_if_due()
+                        print(
+                            f"[RESOLVER] indice_desatualizado | ultimo_merge_ha={index_age:.0f}s"
+                            f" | err={media_resolver.last_error or '-'}"
+                        )
 
             flush_ready_sink_rows(db, sink, cfg, media_resolver=media_resolver, max_rows=50)
             manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None

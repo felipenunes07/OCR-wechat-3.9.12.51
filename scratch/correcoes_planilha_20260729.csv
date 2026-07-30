@@ -1,0 +1,79 @@
+﻿tipo;acao;cliente;banco;valor_na_planilha;data_comprovante;lancado_em;aba;linha_registrada
+VALOR_100X_MAIOR;corrigir para 135,00;6;CLEEND;13500.0;11/06/2026 12:05;2026-06-12 12:42:09;Página1;189
+VALOR_100X_MAIOR;corrigir para 500,00;652;CLEEND;50000.0;09/07/2026 15:48;2026-07-10 15:04:59;Página1;614
+VALOR_100X_MAIOR;corrigir para 365,00;6;CLEEND;36500.0;10/07/2026 15:43;2026-07-13 13:16:52;Página1;535
+VALOR_100X_MAIOR;corrigir para 205,00;6;AMD;20500.0;15/07/2026 11:31;2026-07-21 14:17:59;Página1;311
+VALOR_100X_MAIOR;corrigir para 180,00;652;AMD;18000.0;28/07/2026 08:24;2026-07-28 11:30:08;Página1;276
+VALOR_100X_MAIOR;corrigir para 200,00;6;CLEEND;20000.0;26/07/2026 21:31;2026-07-28 13:38:44;Página1;470
+VALOR_100X_MAIOR;corrigir para 210,00;1;AMD;21000.0;28/07/2026 12:00;2026-07-28 22:08:23;Página1;189
+VALOR_100X_MAIOR;corrigir para 700,00;991;CLEEND;70000.0;29/07/2026 06:50;2026-07-29 11:20:46;Página1;327
+VALOR_100X_MAIOR;corrigir para 160,00;652;AMD;16000.0;29/07/2026 00:05;2026-07-29 12:25:42;Página1;391
+VALOR_100X_MAIOR;corrigir para 160,00;652;AMD;16000.0;29/07/2026 07:22;2026-07-29 12:26:27;Página1;396
+VALOR_100X_MAIOR;corrigir para 950,00;65;AMD;95000.0;29/07/2026 09:56;2026-07-29 13:31:14;Página1;539
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";65;AMD;443976.0;13/06/2026 -;2026-06-13 10:33:51;Página1;260
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;DIAMOND;18236120.0;14/06/2026 -;2026-06-14 15:41:16;Página1;15
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";1;;301318.0;26/06/2026 16:58;2026-06-26 23:02:11;Página1;151
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;DIAMOND;584054.0;08/07/2026 -;2026-07-08 13:42:12;Página1;434
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;;688264.0;08/07/2026 16:13;2026-07-08 13:42:58;Página1;439
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;;963134.0;14/07/2026 13:56;2026-07-14 13:59:21;Página1;224
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";65;CLEEND;15.43;20/07/2026 15:44;2026-07-20 16:32:00;Página1;587
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;;161673.0;22/07/2026 14:38;2026-07-22 00:59:34;Página1;326
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;;808673.0;22/07/2026 13:32;2026-07-22 01:02:35;Página1;191
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";66;DIAMOND;46805.47;26/07/2026 -;2026-07-23 09:55:17;Página1;212
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";116A;;213167.0;24/07/2026 10:35;2026-07-24 14:37:04;Página1;450
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";1;;542343.0;25/07/2026 -;2026-07-25 13:03:49;Página1;161
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";991;CLEEND;109153.0;29/07/2026 13:34;2026-07-29 22:28:03;Página1;229
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";991;CLEEND;109153.0;29/07/2026 14:13;2026-07-29 22:28:29;Página1;232
+CPF_COMO_VALOR;"excluir (CPF mascarado virou valor; conferir imagem)";991;;756313.0;29/07/2026 14:40;2026-07-29 22:29:04;Página1;236
+NUMERO_CLIENTE_COMO_VALOR;corrigir para 100,00 (valor real do deposito);1;AMD;33055.0;17/07/2026 16:10;2026-07-20 20:13:04;Página1;139
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);💵🔐💸FECHAMENTO💵🔐💸;DIAMOND;;08/07/2026 -;2026-07-22 00:34:51;Página1;162
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);💵🔐💸FECHAMENTO💵🔐💸;DIAMOND;;03/07/2026 -;2026-07-22 00:34:55;Página1;163
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);66;;;06/05/2026 10:29;2026-07-22 00:58:03;Página1;304
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);66;DIAMOND;;03/06/2026 13:21;2026-07-22 00:59:57;Página1;332
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);66;;;03/06/2026 13:07;2026-07-22 01:02:05;Página1;353
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 11:06;2026-07-22 12:31:10;Página1;93
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 11:08;2026-07-22 12:31:28;Página1;95
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;22/07/2026 11:19;2026-07-22 12:31:55;Página1;98
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 11:44;2026-07-22 14:39:54;Página1;167
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;22/07/2026 12:46;2026-07-22 14:40:37;Página1;172
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);-;AMD;;29/07/2026 -;2026-07-22 15:08:52;Página1;176
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);-;AMD;;29/07/2026 -;2026-07-22 15:08:56;Página1;177
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);-;AMD;;29/07/2026 -;2026-07-22 15:08:58;Página1;178
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;;;29/07/2026 13:45;2026-07-22 15:41:59;Página1;187
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 13:45;2026-07-22 15:42:08;Página1;188
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;22/07/2026 -;2026-07-22 20:50:15;Página1;3
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;22/07/2026 -;2026-07-22 20:50:17;Página1;4
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;22/07/2026 -;2026-07-22 20:50:19;Página1;5
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;22/07/2026 -;2026-07-22 20:59:13;Página1;6
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;22/07/2026 -;2026-07-22 20:59:15;Página1;7
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;22/07/2026 -;2026-07-22 20:59:17;Página1;8
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);66;;;29/07/2026 13:30;2026-07-23 09:54:41;Página1;201
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);66;DIAMOND;;29/07/2026 -;2026-07-23 09:54:56;Página1;206
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 09:03;2026-07-23 16:18:41;Página1;207
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;23/07/2026 -;2026-07-23 19:00:41;Página1;61
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;23/07/2026 -;2026-07-23 19:00:44;Página1;62
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);168;;;23/07/2026 -;2026-07-23 19:00:47;Página1;63
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);58;AMD;;29/07/2026 12:42;2026-07-24 13:38:40;Página1;431
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 16:04;2026-07-24 14:35:27;Página1;444
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 08:45;2026-07-24 14:36:09;Página1;446
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 -;2026-07-24 14:36:41;Página1;449
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 15:38;2026-07-24 16:04:12;Página1;514
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);303;;;24/07/2026 -;2026-07-24 21:46:16;Página1;541
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);303;;;24/07/2026 -;2026-07-24 21:46:20;Página1;542
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);303;;;24/07/2026 -;2026-07-24 21:46:23;Página1;543
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 21:46:51;Página1;544
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 21:46:54;Página1;545
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 21:46:57;Página1;546
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 22:02:04;Página1;547
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 22:02:11;Página1;548
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;24/07/2026 -;2026-07-24 22:02:14;Página1;549
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;DIAMOND;;29/07/2026 -;2026-07-27 22:18:36;Página1;249
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;;;27/07/2026 -;2026-07-27 22:18:41;Página1;250
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);652;CLEEND;;27/07/2026 10:00;2026-07-28 11:42:04;Página1;354
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);652;CLEEND;;27/07/2026 10:00;2026-07-28 11:42:34;Página1;359
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);1;CLEEND;;27/07/2026 10:00;2026-07-28 11:43:01;Página1;363
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;;;28/07/2026 -;2026-07-28 20:34:56;Página1;793
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;;;28/07/2026 -;2026-07-28 20:35:00;Página1;794
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;;;28/07/2026 -;2026-07-28 20:35:02;Página1;795
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);116A;AMD;;29/07/2026 -;2026-07-29 11:18:35;Página1;320
+LINHA_SEM_VALOR;excluir (continuacao/print de status, sem valor);991;;;29/07/2026 14:11;2026-07-29 22:28:50;Página1;234
