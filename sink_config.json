@@ -1,6 +1,6 @@
 {
   "sink_mode": "google-sheets",
-  "spreadsheet_url": "https://docs.google.com/spreadsheets/d/14_O2qiXu-TYAhz2LeG0wEmjxxaNDpyU16CQiuo0Wf8c/edit?usp=sharing",
+  "spreadsheet_url": "https://docs.google.com/spreadsheets/d/14_O2qiXu-TYAhz2LeG0wEmjxxaNDpyU16CQiuo0Wf8c/edit?usp=sharing&gid=0",
   "worksheet": "",
   "review_worksheet": "",
   "google_credentials_path": "google_service_account.json",
