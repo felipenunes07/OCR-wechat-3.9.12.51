@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -72,6 +73,7 @@ IMG_HEADERS: dict[str, tuple[int, int]] = {
 
 IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".dat"}
 PLAIN_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif"}
+VIDEO_SUFFIXES = {".mp4"}
 LANCZOS_FILTER = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 BASE_LANC_HEADERS = [
     "CLIENTE",
@@ -128,6 +130,32 @@ STALE_PDF_MODIFY_SECONDS = 24 * 3600
 # Report the message index as stale once no merge has landed for this long.
 INDEX_STALE_WARN_SECONDS = 300
 
+# Client 991 sends receipts as short screen recordings instead of prints. The
+# video lane is deliberately scoped to that client: every other client sends
+# prints or PDFs, and a lane open to everyone would pull in unrelated clips.
+# Comma-separated client labels, as they appear in clientes_grupos.json.
+VIDEO_RECEIPT_CLIENTS = {
+    label.strip().upper()
+    for label in os.getenv("WECHAT_VIDEO_RECEIPT_CLIENTS", "991").split(",")
+    if label.strip()
+}
+# The receipt is on screen at the START of these recordings: the client opens the
+# bank app on the receipt and then scrolls. Past the midpoint the value has
+# already left the frame, so sampling late frames only costs OCR time and
+# produces rows with a fallback date (measured on 4 real videos, 11/08/2026).
+VIDEO_FRAME_POSITIONS = (0.0, 0.15, 0.30, 0.45)
+# Videos whose message predates this watermark are never read. Set once, the
+# first time a build with the video lane starts, so enabling the feature does not
+# replay every recording the client ever sent.
+VIDEO_LANE_START_META_KEY = "video_lane_started_at"
+# How long a video waits before looking for its Type=43 message again. The PDF
+# lane retries every 120s, which is fine for a document but far too coarse here:
+# the operator opens videos one after another and expects the sheet to follow
+# that order, and a video parked for two minutes gets overtaken by the next one
+# (12/08/2026). The merge lands every ~20s, so a short retry correlates on the
+# first or second try and keeps the wait well inside OPEN_ORDER_STALL_SECONDS.
+VIDEO_MESSAGE_RETRY_SECONDS = 15
+
 
 def is_stale_pdf_modify(path: Path) -> bool:
     """True for a modify event on a PDF old enough to be background noise.
@@ -154,6 +182,13 @@ def is_candidate(path: Path, thumb_candidates_enabled: bool) -> bool:
     # Client receipts also arrive as PDF files; WeChat stores them flat under
     # FileStorage\File\<YYYY-MM>\ once the file is downloaded/opened.
     if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
+        return True
+
+    # Client 991 sends screen recordings. The .mp4 only lands here once the video
+    # is opened in WeChat; the auto-downloaded .jpg beside it is the poster frame
+    # and is far too small to read (224x398, no bank, wrong date), so it is never
+    # a candidate on its own.
+    if path.suffix.lower() in VIDEO_SUFFIXES and "\\filestorage\\video\\" in s:
         return True
 
     if path.suffix.lower() not in IMG_SUFFIXES:
@@ -241,6 +276,8 @@ def detect_source_kind(path: Path) -> str:
     s = str(path).lower().replace("/", "\\")
     if path.suffix.lower() == ".pdf" and "\\filestorage\\file\\" in s:
         return "file_pdf"
+    if path.suffix.lower() in VIDEO_SUFFIXES and "\\filestorage\\video\\" in s:
+        return "video_receipt"
     if "\\msgattach\\" in s and "\\image\\" in s and path.suffix.lower() == ".dat":
         return "msgattach_image_dat"
     if "\\msgattach\\" in s and "\\thumb\\" in s and path.suffix.lower() == ".dat":
@@ -271,16 +308,24 @@ SHEET_PDF_COLOR = {"red": 0.812, "green": 0.886, "blue": 0.953}
 # Light gray (#D9D9D9): destination bank not recognized (not AMD/CLEEND/...),
 # so the receipt may have been paid to the wrong account.
 SHEET_NO_BANK_COLOR = {"red": 0.851, "green": 0.851, "blue": 0.851}
+# Light yellow (#FFF2CC) used to tint rows read from a video receipt.
+SHEET_VIDEO_COLOR = {"red": 1.0, "green": 0.949, "blue": 0.800}
 # White, used to clear a previous tint when a value becomes trustworthy.
 SHEET_CLEAR_COLOR = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 
 def sheet_row_color(row_payload: dict[str, Any]) -> dict[str, float]:
-    # Priority: red (guessed value) > orange (unknown bank) > blue (PDF) > white.
+    # Priority: red (guessed value) > gray (unknown bank) > yellow (video)
+    # > blue (PDF) > white. Yellow and blue sit below the two warnings on
+    # purpose: they label where the row came from, while red and gray say the
+    # row needs checking -- a video paid to an unrecognized account must still
+    # show up as gray.
     if row_payload.get("value_uncertain"):
         return SHEET_GUESS_COLOR
     if not str(row_payload.get("bank") or "").strip():
         return SHEET_NO_BANK_COLOR
+    if row_payload.get("is_video"):
+        return SHEET_VIDEO_COLOR
     if row_payload.get("is_pdf"):
         return SHEET_PDF_COLOR
     return SHEET_CLEAR_COLOR
@@ -404,6 +449,98 @@ def load_pdf_receipt(path: Path) -> tuple[Optional[str], Optional[Image.Image], 
         return (None, bitmap.to_pil().convert("RGB"), raw)
     finally:
         doc.close()
+
+
+def load_video_receipt(
+    path: Path,
+    ocr: "OCREngine",
+) -> tuple[Optional[Image.Image], bytes, Optional[str], float, float]:
+    """Read a receipt filmed as a screen recording.
+
+    Returns (frame, frame PNG bytes, OCR text, OCR confidence, OCR ms). The frame
+    is picked by OCR-ing a few early positions and keeping the first one that
+    parses into a receipt with a value -- the client films the receipt, then
+    scrolls, so a fixed frame index is not reliable while an early one almost
+    always is.
+
+    Returns (None, b"", None, 0.0, ms) when the video is readable but shows no
+    text at all, which is terminal: it was not a receipt. Raises OSError when
+    nothing could be decoded, which is what a still-downloading .mp4 looks like
+    -- the caller retries those instead of dropping them.
+    """
+    import cv2  # lazy: only needed when videos actually arrive
+
+    started_at = time.perf_counter()
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise OSError(f"video ilegivel (download em andamento?): {path.name}")
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            raise OSError(f"video sem frames (download em andamento?): {path.name}")
+
+        best: Optional[tuple[Image.Image, str, float]] = None
+        frames_read = 0
+        seen_indexes: set[int] = set()
+        for position in VIDEO_FRAME_POSITIONS:
+            index = min(max(0, int(total * position)), total - 1)
+            if index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            frames_read += 1
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            text, conf = ocr.extract(img)
+            if not text.strip():
+                continue
+            # Keep the highest-confidence frame as a fallback so a video that
+            # never parses still reports what it saw instead of nothing.
+            if best is None or conf > best[2]:
+                best = (img, text, conf)
+            is_receipt, _reason = looks_like_single_receipt(text)
+            if not is_receipt:
+                continue
+            if parse_receipt_fields(text, ocr_conf=conf, q_score=1.0).get("amount") is None:
+                continue
+            best = (img, text, conf)
+            break
+    finally:
+        cap.release()
+
+    ocr_ms = perf_duration_ms(started_at)
+    if frames_read == 0:
+        # The container opened but not a single frame decoded: same "half a file
+        # on disk" story as the checks above, so it retries rather than drops.
+        raise OSError(f"nenhum frame decodificado (download em andamento?): {path.name}")
+    if best is None:
+        return (None, b"", None, 0.0, ocr_ms)
+    img, text, conf = best
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return (img, buffer.getvalue(), text, conf, ocr_ms)
+
+
+def delete_processed_video(path: Path) -> bool:
+    """Drop a video whose receipt is already on the sheet.
+
+    Client 991 sends several recordings a day and each is ~0.5 MB, so they are
+    removed once the row is committed. Only the .mp4 goes: the poster .jpg beside
+    it is what WeChat renders in the chat, and the message itself is untouched,
+    so the video can still be downloaded again from the conversation.
+    """
+    try:
+        if not path.exists():
+            return False
+        # WeChat stores these read-only; unlink refuses until that is cleared.
+        os.chmod(path, stat.S_IWRITE)
+        path.unlink()
+        return True
+    except Exception as exc:
+        print(f"[VIDEO] falha ao excluir {path.name} | {type(exc).__name__}: {exc}")
+        return False
 
 
 def quality_score(img: Image.Image) -> float:
@@ -1705,6 +1842,17 @@ def build_sheet_payload_from_receipt(
             ),
             # Tints the row blue on the sheet so PDF receipts are recognizable.
             "is_pdf": receipt_payload.get("source_kind") == "file_pdf",
+            # Tints the row yellow, so a value read off a screen recording is
+            # recognizable at a glance.
+            "is_video": receipt_payload.get("source_kind") == "video_receipt",
+            # The recording is deleted once this row is on the sheet -- see
+            # delete_processed_video(). Carried here because the sink commits
+            # from the stored payload, not from the queue item.
+            "video_path": (
+                receipt_payload.get("resolved_media_path")
+                if receipt_payload.get("source_kind") == "video_receipt"
+                else None
+            ),
         }
     )
     return payload
@@ -1870,6 +2018,7 @@ class WeChatDBResolver:
         # declared wedged and a fresh one is allowed through.
         self.merge_stall_seconds = 300
         self._newest_msg_cache: tuple[float, float] = (0.0, 0.0)  # (merge_mtime, newest_create_time)
+        self._sweep_orphan_merge_tmps()
         self._load_dependencies()
         self._load_account_info(force=True)
 
@@ -2138,41 +2287,80 @@ class WeChatDBResolver:
             return False, f"no_msg_shards_in:{multi_dir}"
 
         decrypted: list[Path] = []
-        for shard in shards:
-            # Scoped to target_path so two overlapping merge attempts never
-            # decrypt into the same intermediate file.
-            out = target_path.with_name(f"de_{shard.stem.lower()}_{target_path.name}")
-            code, detail = self._decrypt_db_with_wal(shard, out)
-            if not code:
-                return False, f"{shard.name}:{detail}"
-            decrypted.append(out)
+        try:
+            for shard in shards:
+                # Scoped to target_path so two overlapping merge attempts never
+                # decrypt into the same intermediate file.
+                out = target_path.with_name(f"de_{shard.stem.lower()}_{target_path.name}")
+                # Recorded before decrypting so the cleanup below also catches a
+                # half-written intermediate left by a shard that fails.
+                decrypted.append(out)
+                code, detail = self._decrypt_db_with_wal(shard, out)
+                if not code:
+                    return False, f"{shard.name}:{detail}"
 
-        if len(decrypted) == 1:
+            if len(decrypted) == 1:
+                try:
+                    if target_path.exists():
+                        target_path.unlink()
+                    decrypted[0].replace(target_path)
+                except Exception as exc:
+                    return False, f"finalize_failed:{type(exc).__name__}:{exc}"
+                return True, "ok:single_shard"
+
+            # Multiple shards: copy the first, append the MSG rows of the rest.
             try:
                 if target_path.exists():
                     target_path.unlink()
                 decrypted[0].replace(target_path)
+                conn = sqlite3.connect(str(target_path))
+                try:
+                    # localId is the INTEGER PRIMARY KEY and WeChat restarts it at
+                    # 1 in every new shard, so "INSERT OR IGNORE ... SELECT *"
+                    # collided on every single row of MSG1 and silently dropped
+                    # the whole shard. WeChat rolled over to MSG1.db on 07/08/2026
+                    # at 20:24 and the index froze on that exact timestamp for
+                    # five days: images kept working (they resolve by path) but
+                    # every PDF was skipped as pdf_sem_mensagem_no_indice.
+                    # Copy every column EXCEPT localId, let AUTOINCREMENT assign a
+                    # fresh one, and dedupe on MsgSvrID -- the only id that is
+                    # actually stable across shards.
+                    cols = [str(row[1]) for row in conn.execute("PRAGMA table_info(MSG)")]
+                    copy_cols = [c for c in cols if c.lower() != "localid"]
+                    if not copy_cols:
+                        return False, "multi_merge_failed:msg_table_without_columns"
+                    col_list = ",".join(f'"{c}"' for c in copy_cols)
+                    merged_rows = 0
+                    for extra in decrypted[1:]:
+                        conn.execute("ATTACH DATABASE ? AS extra", (str(extra),))
+                        cur = conn.execute(
+                            f"INSERT INTO main.MSG ({col_list}) "
+                            f"SELECT {col_list} FROM extra.MSG AS e "
+                            # MsgSvrID 0/NULL marks local-only rows (system
+                            # notices): they share that placeholder, so deduping
+                            # them by it would drop all but the first.
+                            "WHERE e.MsgSvrID IS NULL OR e.MsgSvrID = 0 "
+                            "   OR NOT EXISTS (SELECT 1 FROM main.MSG AS m WHERE m.MsgSvrID = e.MsgSvrID)"
+                        )
+                        merged_rows += int(cur.rowcount or 0)
+                        conn.commit()
+                        conn.execute("DETACH DATABASE extra")
+                finally:
+                    conn.close()
             except Exception as exc:
-                return False, f"finalize_failed:{type(exc).__name__}:{exc}"
-            return True, "ok:single_shard"
-
-        # Multiple shards: copy the first, append the MSG rows of the rest.
-        try:
-            if target_path.exists():
-                target_path.unlink()
-            decrypted[0].replace(target_path)
-            conn = sqlite3.connect(str(target_path))
-            try:
-                for extra in decrypted[1:]:
-                    conn.execute("ATTACH DATABASE ? AS extra", (str(extra),))
-                    conn.execute("INSERT OR IGNORE INTO MSG SELECT * FROM extra.MSG")
-                    conn.commit()
-                    conn.execute("DETACH DATABASE extra")
-            finally:
-                conn.close()
-        except Exception as exc:
-            return False, f"multi_merge_failed:{type(exc).__name__}:{exc}"
-        return True, f"ok:{len(decrypted)}_shards"
+                return False, f"multi_merge_failed:{type(exc).__name__}:{exc}"
+            return True, f"ok:{len(decrypted)}_shards:+{merged_rows}_rows"
+        finally:
+            # Every intermediate is a full decrypted copy of a shard (~200 MB).
+            # Only decrypted[0] is consumed by .replace(); the extras and any
+            # written before a failing shard used to stay on disk forever --
+            # 1482 of them filled a 465 GB disk in three days (2026-08-11).
+            for leftover in decrypted:
+                try:
+                    if leftover.exists():
+                        leftover.unlink()
+                except Exception:
+                    pass
 
     def _merge_real_time_db_with_timeout_path_legacy(self, target_path: Path) -> tuple[bool, str]:
         assert self._wx_key is not None
@@ -2238,12 +2426,60 @@ class WeChatDBResolver:
         self._last_error = detail
         return False
 
+    def _sweep_orphan_merge_tmps(self) -> None:
+        """Remove decrypted-shard leftovers from earlier runs.
+
+        The per-attempt cleanup cannot help an attempt that wedges and never
+        returns -- its ~200 MB intermediates outlive the process. This runs at
+        construction, before the first merge starts, so nothing alive owns any
+        of the files it matches. Deliberately narrow: the live index, its
+        sqlite sidecars and the base_msg*.cache.db caches must survive.
+
+        Only files written before today are removed (Felipe, 2026-08-11): an
+        orphan from the current day still gets a full day of grace, and
+        scripts/cleanup-runtime-tmp.ps1 sweeps it on a later run.
+        """
+        runtime_dir = self.merge_path.parent
+        if not runtime_dir.is_dir():
+            return
+
+        cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+        merge_name = self.merge_path.name
+        keep = {merge_name.lower(), f"{merge_name}-wal".lower(), f"{merge_name}-shm".lower()}
+        # "<anything>.db.tmp<seq>" covers both the attempt's own tmp and the
+        # "de_msgN_<tmp name>" intermediates scoped to it.
+        tmp_re = re.compile(r"\.db\.tmp\d*$", re.IGNORECASE)
+        # Intermediates of a merge that targeted the live index directly have no
+        # .tmp suffix to match on.
+        direct_re = re.compile(rf"^de_msg\d+_{re.escape(merge_name)}$", re.IGNORECASE)
+
+        removed = 0
+        freed = 0
+        for entry in runtime_dir.iterdir():
+            if entry.name.lower() in keep or not entry.is_file():
+                continue
+            if not (tmp_re.search(entry.name) or direct_re.match(entry.name)):
+                continue
+            try:
+                stat = entry.stat()
+                if stat.st_mtime >= cutoff:
+                    continue
+                size = stat.st_size
+                entry.unlink()
+                removed += 1
+                freed += size
+            except Exception:
+                pass
+        if removed:
+            print(f"[RESOLVER] limpeza: {removed} tmp orfaos removidos ({freed / (1024 ** 3):.2f} GB)")
+
     def _run_background_merge(self, started_at: float, force: bool, seq: int = 0) -> None:
+        # One tmp file per attempt: a wedged attempt that wakes up later must
+        # not write into the file the current attempt is building.
+        tmp_merge_path = self.merge_path.with_suffix(f".db.tmp{seq or ''}")
         try:
             self.merge_path.parent.mkdir(parents=True, exist_ok=True)
-            # One tmp file per attempt: a wedged attempt that wakes up later must
-            # not write into the file the current attempt is building.
-            tmp_merge_path = self.merge_path.with_suffix(f".db.tmp{seq or ''}")
             if tmp_merge_path.exists():
                 try:
                     tmp_merge_path.unlink()
@@ -2307,6 +2543,15 @@ class WeChatDBResolver:
         except Exception as exc:
             with self._lock:
                 self._mark_refresh_failure(time.time(), f"bg_merge_exception:{type(exc).__name__}:{exc}")
+        finally:
+            # A successful swap consumes the tmp via os.replace. Every other exit
+            # -- superseded attempt, refused swap, failed merge, exception --
+            # must not leave a ~200 MB file behind.
+            try:
+                if tmp_merge_path.exists():
+                    tmp_merge_path.unlink()
+            except Exception:
+                pass
 
     def refresh_if_due(self, force: bool = False) -> bool:
         if self._pywxdump is None:
@@ -2579,6 +2824,73 @@ class WeChatDBResolver:
             # instr() matched raw bytes; confirm it was the file name and not a
             # longer name that happens to contain it.
             if normalize_windows_text(PureWindowsPath(file_rel).name) != target:
+                continue
+            return self._message_ref_from_file_row(row, file_rel)
+        return None
+
+    def _extract_video_file_path(self, bytes_extra: Any) -> Optional[str]:
+        try:
+            decoded = self._decode_bytes_extra(bytes_extra) if self._decode_bytes_extra else {}
+        except Exception:
+            decoded = {}
+        items = decoded.get("3") if isinstance(decoded, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("2") or "").strip()
+                lowered = value.lower().replace("/", "\\")
+                if "\\filestorage\\video\\" in lowered and lowered.endswith(".mp4"):
+                    return value
+        raw_text = str(decoded)
+        match = re.search(r"(wxid_[^\\']+\\FileStorage\\Video\\[^']+?\.mp4)", raw_text, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def find_video_message_by_name(self, path: Path) -> Optional[WeChatMessageRef]:
+        """Find the Type=43 message that produced this video, by file name.
+
+        WeChat names the file after a hash of the video, so the stem is already a
+        unique key and no time window is needed -- which matters because the
+        .mp4's mtime is the moment it was downloaded, often hours after the
+        client sent it.
+        """
+        if not self.refresh_if_due():
+            return None
+        if not self.merge_path.exists():
+            return None
+        # The stem, not the full name: BytesExtra stores the .jpg poster and the
+        # .mp4 under the same hash, and either one identifies the message.
+        needle = path.stem.encode("utf-8", "ignore")
+        if not needle:
+            return None
+
+        conn = sqlite3.connect(f"file:{self.merge_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                FROM MSG
+                WHERE Type=43
+                  AND instr(CAST(BytesExtra AS BLOB), ?) > 0
+                ORDER BY CreateTime DESC
+                LIMIT 20
+                """,
+                (needle,),
+            ).fetchall()
+        except Exception:
+            return None
+        finally:
+            conn.close()
+
+        target = normalize_windows_text(path.stem)
+        for row in rows:
+            file_rel = self._extract_video_file_path(row["BytesExtra"])
+            if not file_rel:
+                continue
+            # instr() matched raw bytes; confirm it was this video's hash and not
+            # a longer name that happens to contain it.
+            if normalize_windows_text(PureWindowsPath(file_rel).stem) != target:
                 continue
             return self._message_ref_from_file_row(row, file_rel)
         return None
@@ -4254,15 +4566,21 @@ class StateDB:
                 blocker_note: Optional[str] = None
 
                 if source_mtime > 0:
-                    # Opening-order gate: never commit this row while an image opened
-                    # BEFORE it (earlier file mtime) is still being read. A candidate
-                    # that stalls (held/retrying for over OPEN_ORDER_STALL_SECONDS)
-                    # stops blocking so one bad file cannot freeze the sheet.
+                    # Opening-order gate: never commit this row while a media file
+                    # opened BEFORE it (earlier file mtime) is still being read. A
+                    # candidate that stalls (held/retrying for over
+                    # OPEN_ORDER_STALL_SECONDS) stops blocking so one bad file
+                    # cannot freeze the sheet.
+                    #
+                    # video_receipt belongs here: a video takes a beat longer than a
+                    # print (download, then a few frames to OCR), so leaving it out
+                    # let a video opened later commit ahead of one opened first --
+                    # 12/08/2026, rows 501/504/505 landed out of opening order.
                     prior_open = cur.execute(
                         """
                         SELECT file_id
                         FROM files
-                        WHERE source_kind IN ('msgattach_image_dat', 'msgattach_image_plain')
+                        WHERE source_kind IN ('msgattach_image_dat', 'msgattach_image_plain', 'video_receipt')
                           AND file_id <> ?
                           AND status IN ('pending', 'retry', 'processing')
                           AND mtime < ?
@@ -5411,11 +5729,16 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
                     depth_from_fs = -1
 
                 if depth_from_fs == 0:
-                    # We are at FileStorage root. Only keep MsgAttach and Temp.
-                    dirnames[:] = [d for d in dirnames if d.lower() in ('msgattach', 'temp')]
+                    # We are at FileStorage root. Only keep MsgAttach, Temp and Video.
+                    dirnames[:] = [d for d in dirnames if d.lower() in ('msgattach', 'temp', 'video')]
                 elif depth_from_fs == 1 and abs_parts[-1] == 'msgattach':
                     # Inside MsgAttach. Keep all chat hash folders.
                     pass
+                elif depth_from_fs == 1 and abs_parts[-1] == 'video':
+                    # Inside Video (flat: Video\<YYYY-MM>\<hash>.mp4). Reconcile is
+                    # only the safety net here -- a downloaded .mp4 normally
+                    # arrives as a watchdog create event.
+                    dirnames[:] = [d for d in dirnames if d in allowed_months]
                 elif depth_from_fs == 2 and abs_parts[-2] == 'msgattach':
                     # Inside MsgAttach/<chat_id>. Only keep Image and Thumb.
                     dirnames[:] = [d for d in dirnames if d.lower() in ('image', 'thumb')]
@@ -5848,6 +6171,30 @@ def resolve_media_candidate(
             msg_ref=msg_ref,
         )
 
+    if original_source_kind == "video_receipt":
+        # Same shape as the PDF lane: the file is already the full media, the
+        # only work is attributing it to a group via its Type=43 message.
+        runtime_resolver = runtime_media_resolver(media_resolver)
+        msg_ref = (
+            runtime_resolver.find_video_message_by_name(original_path)
+            if runtime_resolver is not None
+            else None
+        )
+        client_source_path = original_path
+        if msg_ref is not None and msg_ref.talker:
+            group_hash = hashlib.md5(str(msg_ref.talker).encode("utf-8")).hexdigest()
+            client_source_path = original_path.parent / "MsgAttach" / group_hash / original_path.name
+        return MediaResolution(
+            original_source_path=original_path,
+            original_source_kind=original_source_kind,
+            resolved_path=original_path,
+            resolved_source_kind="video_receipt",
+            client_source_path=client_source_path,
+            resolution_source="video_receipt",
+            verification_status="CONFIRMADO",
+            msg_ref=msg_ref,
+        )
+
     if original_source_kind == "temp_image":
         context_path_str = db.find_recent_msgattach_context_path(
             item.mtime,
@@ -6172,6 +6519,41 @@ def process_item(
             print(f"[SKIP] {path.name} | {ignore_reason}")
             return
 
+        if resolution.resolved_source_kind == "video_receipt":
+            video_client = resolver.resolve(resolution.client_source_path)
+            if resolution.msg_ref is None:
+                # Without the Type=43 message there is no group, so no client --
+                # and Video\ holds every recording ever downloaded, so an
+                # uncorrelated file must never be published. Same grace rule as
+                # PDFs: only give up once the index is known to have caught up.
+                held_for = time.time() - float(item.first_seen or 0.0)
+                index_is_current = (
+                    active_media_resolver is not None
+                    and active_media_resolver.last_successful_refresh >= float(item.first_seen or 0.0)
+                )
+                if index_is_current and held_for >= PDF_ORPHAN_GRACE_SECONDS:
+                    db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="VIDEO_SEM_MENSAGEM")
+                    print(f"[SKIP] {path.name} | video_sem_mensagem_no_indice | esperou={held_for:.0f}s")
+                else:
+                    db.mark_hold(item.file_id, reason="WAITING_VIDEO_MESSAGE", delay_sec=VIDEO_MESSAGE_RETRY_SECONDS)
+                    print(f"[HOLD] {path.name} | aguardando_mensagem_do_video | indice_atual={index_is_current}")
+                return
+            if str(video_client or "").strip().upper() not in VIDEO_RECEIPT_CLIENTS:
+                db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="VIDEO_CLIENTE_NAO_HABILITADO")
+                db.mark_message_job_resolved(msg_svr_id, note="VIDEO_CLIENTE_NAO_HABILITADO")
+                print(f"[SKIP] {path.name} | video_fora_do_escopo | cliente={video_client or '-'}")
+                return
+            lane_start = db.get_meta_float(VIDEO_LANE_START_META_KEY) or 0.0
+            msg_create_time = float(resolution.msg_ref.create_time or 0.0)
+            if 0.0 < msg_create_time < lane_start:
+                # Gate on when the CLIENT SENT the video, not on the file mtime:
+                # mtime is the download moment, so reopening an old recording
+                # would otherwise republish a receipt from weeks ago.
+                db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="VIDEO_ANTERIOR_A_ATIVACAO")
+                db.mark_message_job_resolved(msg_svr_id, note="VIDEO_ANTERIOR_A_ATIVACAO")
+                print(f"[SKIP] {path.name} | video_anterior_a_ativacao | cliente={video_client}")
+                return
+
         client = resolver.resolve(resolution.client_source_path)
         if not client:
             gid = extract_group_id_from_path(resolution.client_source_path) or "SEM_GRUPO"
@@ -6215,11 +6597,25 @@ def process_item(
 
         open_started_at = time.perf_counter()
         pdf_text: Optional[str] = None
+        video_text: Optional[str] = None
+        video_conf = 0.0
+        video_ocr_ms = 0.0
         if resolution.resolved_source_kind == "file_pdf":
             pdf_text, pdf_img, img_bytes = load_pdf_receipt(path)
             # With a text layer there is nothing to OCR; the placeholder image is
             # never rendered anywhere.
             img = pdf_img if pdf_img is not None else Image.new("RGB", (8, 8), "white")
+        elif resolution.resolved_source_kind == "video_receipt":
+            video_img, img_bytes, video_text, video_conf, video_ocr_ms = load_video_receipt(path, ocr)
+            if video_img is None:
+                # Not every recording is a receipt (the client also sends clips
+                # of the app, of a screen, of nothing). Dropping it here keeps
+                # the file on disk for a human to look at.
+                db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="VIDEO_SEM_COMPROVANTE")
+                db.mark_message_job_resolved(msg_svr_id, note="VIDEO_SEM_COMPROVANTE")
+                print(f"[SKIP] {path.name} | video_sem_comprovante_legivel | cliente={client}")
+                return
+            img = video_img
         else:
             img, img_bytes, _ext, _key = open_image_from_file(path)
         open_ms = perf_duration_ms(open_started_at)
@@ -6251,6 +6647,14 @@ def process_item(
             prep_ms = 0.0
             text, ocr_conf = pdf_text, 1.0
             ocr_ms = 0.0
+        elif video_text is not None:
+            # The frame was already OCR'd while being chosen; running the same
+            # pass again here would double the cost of every video for nothing.
+            q_score = quality_score(img)
+            img_for_ocr = img
+            prep_ms = 0.0
+            text, ocr_conf = video_text, video_conf
+            ocr_ms = video_ocr_ms
         else:
             q_score = quality_score(img)
 
@@ -6617,6 +7021,11 @@ def flush_ready_sink_rows(
         committed_at = time.time()
         db.mark_receipt_sink_committed(file_id, sheet, row, committed_at=committed_at)
         committed += 1
+        # Only now: while the row was still pending the file was the one way to
+        # recheck the reading by hand.
+        video_path = str(claimed["row_payload"].get("video_path") or "").strip()
+        if video_path and delete_processed_video(Path(video_path)):
+            print(f"[VIDEO] excluido apos lancar | {Path(video_path).name} | row={row}")
         print(
             f"[SINK] committed | file_id={file_id} | msg={msg_svr_id} | talker={talker} "
             f"| create_time={msg_create_time:.0f} | sheet={sheet} | row={row} "
@@ -7071,6 +7480,16 @@ def main() -> int:
         else:
             print(f"WeChat DB resolver: degraded_to_path_only | err={media_resolver.last_error or 'unknown'}")
     print(f"UI force runtime enabled: {db.is_ui_force_runtime_enabled(default_enabled=cfg.ui_force_download_enabled)}")
+
+    # Stamped on the first start that has the video lane, and never again: it is
+    # what makes "only from now on" mean the same thing across restarts.
+    if db.get_meta_float(VIDEO_LANE_START_META_KEY) is None:
+        db.set_meta(VIDEO_LANE_START_META_KEY, f"{time.time():.0f}")
+    video_lane_start = db.get_meta_float(VIDEO_LANE_START_META_KEY) or 0.0
+    print(
+        f"Video receipts: clientes={','.join(sorted(VIDEO_RECEIPT_CLIENTS)) or '-'} "
+        f"| desde={datetime.fromtimestamp(video_lane_start):%d/%m/%Y %H:%M}"
+    )
 
     requeued = db.requeue_mapped_missing_client(resolver, max_age_hours=3, limit=1200)
     if requeued:
