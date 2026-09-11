@@ -14,6 +14,11 @@ from typing import Any, Optional
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    import psutil
+except ImportError:  # ambiente sem psutil: nao da para confirmar a identidade do PID
+    psutil = None  # type: ignore[assignment]
+
 
 APP_TITLE = "Painel WeChat OCR"
 REFRESH_SECONDS = 5
@@ -24,6 +29,7 @@ MAX_LOG_LINES = 24
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
 SINK_CONFIG_FILE = "sink_config.json"
+DAEMON_CMDLINE_TOKEN = "wechat_receipt_daemon.py"
 IGNORED_BY_USER_STATE = "IGNORED_BY_USER"
 IGNORE_ITEM_REASON = "IGNORED_BY_USER_ITEM"
 IGNORE_QUEUE_REASON = "IGNORED_BY_USER_CLEAR_QUEUE"
@@ -273,33 +279,41 @@ def read_tail_lines(path: Path, max_lines: int = MAX_LOG_LINES) -> list[str]:
         return [f"Nao foi possivel ler o log: {type(exc).__name__}: {exc}"]
 
 
-def process_status(pid_file: Path) -> tuple[str, bool]:
+def read_pid_file(pid_file: Path) -> Optional[int]:
     if not pid_file.exists():
-        return "Daemon parado", False
+        return None
     try:
         raw = pid_file.read_text(encoding="ascii", errors="ignore").strip().splitlines()[0]
-        pid = int(raw)
+        return int(raw)
     except Exception:
-        return "PID invalido", False
+        return None
+
+
+def is_daemon_pid(pid: int) -> bool:
+    """Confirma que o PID gravado ainda e o daemon, e nao um PID reciclado.
+
+    Depois de reiniciar o PC o Windows reaproveita PIDs, entao o numero salvo
+    antes do boot costuma pertencer a outro programa qualquer. Conferir so a
+    existencia do processo faz o painel mostrar verde com o daemon morto e o
+    botao de parar matar o processo alheio.
+    """
+    if psutil is None or pid <= 0:
+        return False
     try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            check=False,
-        )
-        output = (result.stdout or "").strip()
-        if output and "No tasks are running" not in output and "INFO:" not in output:
-            return f"Daemon rodando | PID {pid}", True
+        cmdline = " ".join(psutil.Process(pid).cmdline())
     except Exception:
-        try:
-            os.kill(pid, 0)
-            return f"Daemon rodando | PID {pid}", True
-        except Exception:
-            pass
+        return False
+    return DAEMON_CMDLINE_TOKEN in cmdline.lower()
+
+
+def process_status(pid_file: Path) -> tuple[str, bool]:
+    pid = read_pid_file(pid_file)
+    if pid is None:
+        return ("Daemon parado", False) if not pid_file.exists() else ("PID invalido", False)
+    if is_daemon_pid(pid):
+        return f"Daemon rodando | PID {pid}", True
+    if psutil is None:
+        return f"Daemon nao verificavel (psutil ausente) | ultimo PID {pid}", False
     return f"Daemon parado | ultimo PID {pid}", False
 
 
@@ -800,15 +814,21 @@ def stop_daemon_processing(base_dir: Path) -> tuple[bool, str]:
     if not pid_path.exists():
         return True, "Daemon ja estava parado."
 
-    try:
-        raw = pid_path.read_text(encoding="ascii", errors="ignore").strip().splitlines()[0]
-        pid = int(raw)
-    except Exception:
+    pid = read_pid_file(pid_path)
+    if pid is None:
         try:
             pid_path.unlink(missing_ok=True)
         except Exception:
             pass
         return True, "PID invalido removido. Daemon considerado parado."
+
+    if not is_daemon_pid(pid):
+        # PID reciclado por outro programa (tipico apos reiniciar o PC).
+        try:
+            pid_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True, f"Daemon ja estava parado. PID antigo {pid} descartado sem matar ninguem."
 
     try:
         result = subprocess.run(

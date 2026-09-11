@@ -1,5 +1,6 @@
 ﻿$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidf = Join-Path $dir "wechat_receipt.pid"
+. (Join-Path $dir "wechat_pid_lib.ps1")
 $logOut = Join-Path $dir "wechat_receipt.out.log"
 $logErr = Join-Path $dir "wechat_receipt.err.log"
 $sinkConfigPath = Join-Path $dir "sink_config.json"
@@ -7,16 +8,16 @@ $excel = Join-Path $dir "pagamentos_wechat.xlsx"
 $db = Join-Path $dir "wechat_receipt_state.db"
 $isExcelSink = $true
 
-if (Test-Path $pidf) {
-  $daemonPid = (Get-Content $pidf | Select-Object -First 1)
-  $p = Get-Process -Id $daemonPid -ErrorAction SilentlyContinue
-  if ($p) {
-    Write-Output "STATUS=RODANDO PID=$daemonPid"
-  } else {
-    Write-Output "STATUS=PARADO (PID antigo: $daemonPid)"
-  }
+$daemonProc = Get-WeChatDaemonProcess -PidFile $pidf
+if ($daemonProc) {
+  Write-Output "STATUS=RODANDO PID=$($daemonProc.ProcessId)"
 } else {
-  Write-Output "STATUS=PARADO"
+  $daemonPid = Read-WeChatDaemonPid -PidFile $pidf
+  if ($daemonPid -gt 0) {
+    Write-Output "STATUS=PARADO (PID antigo: $daemonPid)"
+  } else {
+    Write-Output "STATUS=PARADO"
+  }
 }
 
 if (Test-Path $sinkConfigPath) {

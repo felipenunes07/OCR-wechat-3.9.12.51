@@ -8,6 +8,7 @@ $logOut = Join-Path $dir "wechat_receipt.out.log"
 $logErr = Join-Path $dir "wechat_receipt.err.log"
 $log = $logOut
 $pidf = Join-Path $dir "wechat_receipt.pid"
+. (Join-Path $dir "wechat_pid_lib.ps1")
 
 # Prefer the project venv python, but fall back to system python if needed.
 $py = Join-Path $dir ".venv\\Scripts\\python.exe"
@@ -121,15 +122,16 @@ if (Test-Path $mapUpdater) {
   }
 }
 
+$running = Get-WeChatDaemonProcess -PidFile $pidf
+if ($running) {
+  Write-Output "JA_EM_EXECUCAO PID=$($running.ProcessId)"
+  exit 0
+}
+# PID gravado nao e mais o daemon (tipico depois de reiniciar o PC): descarta.
 if (Test-Path $pidf) {
-  $oldPid = (Get-Content $pidf -ErrorAction SilentlyContinue | Select-Object -First 1)
-  if ($oldPid) {
-    $pOld = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-    if ($pOld) {
-      Write-Output "JA_EM_EXECUCAO PID=$oldPid"
-      exit 0
-    }
-  }
+  $stalePid = Read-WeChatDaemonPid -PidFile $pidf
+  if ($stalePid -gt 0) { Write-Output "PID_ANTIGO_DESCARTADO=$stalePid" }
+  Remove-Item $pidf -Force -ErrorAction SilentlyContinue
 }
 
 $arguments = @(
