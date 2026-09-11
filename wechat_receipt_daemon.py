@@ -83,6 +83,9 @@ BASE_LANC_HEADERS = [
     "VALOR",
 ]
 DEFAULT_VERIFICATION_COLUMN_NAME = "STATUS_VERIFICACAO"
+# Same client + byte-identical image inside this window = one message seen
+# twice (direct_image lane + db_image lane), never two payments.
+IMAGE_SHA_DEDUP_WINDOW_SECONDS = 120
 UI_FORCE_RUNTIME_META_KEY = "ui_force_runtime_enabled"
 MANUAL_SESSION_META_KEY = "manual_session_started_at"
 MANUAL_SESSION_ID_META_KEY = "manual_session_id"
@@ -355,6 +358,24 @@ def build_sink_row_values(row_payload: dict[str, Any]) -> list[Any]:
         row_payload.get("bank"),
         row_payload.get("amount"),
     ]
+
+
+def _sink_cell_key(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return ""
+    try:
+        number = float(text.replace(",", "."))
+    except ValueError:
+        return text.casefold()
+    return f"{number:.2f}"
+
+
+def sink_row_values_match(expected: list[Any], cells: list[Any]) -> bool:
+    """Compare what we meant to write with what the sheet returns (strings,
+    numbers rendered without decimals, trailing empty cells dropped)."""
+    padded = list(cells) + [""] * max(0, len(expected) - len(cells))
+    return all(_sink_cell_key(a) == _sink_cell_key(b) for a, b in zip(expected, padded))
 
 
 def resolve_full_image_from_thumb_path(thumb_path: Path) -> Optional[Path]:
@@ -4356,6 +4377,38 @@ class StateDB:
             row = self._conn.execute("SELECT 1 FROM receipts WHERE sha256=? LIMIT 1", (sha256,)).fetchone()
             return row is not None
 
+    def receipt_sha_exists_recent(
+        self,
+        sha256: str,
+        exclude_file_id: str,
+        client: Optional[str],
+        window_seconds: float,
+    ) -> bool:
+        """True if another file with byte-identical content was ingested for the
+        same client less than ``window_seconds`` ago. Sheet status is irrelevant:
+        a staged-but-not-yet-committed twin counts as well."""
+        if not sha256:
+            return False
+        since = time.time() - float(window_seconds)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM receipts
+                WHERE sha256=? AND file_id<>? AND IFNULL(client,'')=? AND ingested_at>=?
+                LIMIT 1
+                """,
+                (sha256, str(exclude_file_id), str(client or ""), float(since)),
+            ).fetchone()
+            return row is not None
+
+    def sheet_row_already_claimed(self, sheet_name: str, row_idx: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM receipts WHERE excel_sheet=? AND excel_row=? LIMIT 1",
+                (str(sheet_name), int(row_idx)),
+            ).fetchone()
+            return row is not None
+
     def receipt_sha_exists_other(self, sha256: str, exclude_file_id: str, client: Optional[str] = None) -> bool:
         """True if some OTHER file already produced a receipt with this exact image
         for the same client.
@@ -5368,6 +5421,12 @@ class RowSink:
     def append(self, row_payload: dict[str, Any], review_needed: bool) -> tuple[str, int]:
         raise NotImplementedError
 
+    def find_last_row_if_matches(self, row_payload: dict[str, Any], review_needed: bool) -> Optional[tuple[str, int]]:
+        """After a failed append: (sheet, row) if the LAST row of the target sheet
+        already holds exactly this payload, else None. Sinks without a cheap way
+        to look back simply return None and the caller retries as before."""
+        return None
+
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
         raise NotImplementedError
 
@@ -5595,6 +5654,22 @@ class GoogleSheetsSink(RowSink):
                 table_range=sheet_table_range(self.headers),
             )
             row_idx = len(worksheet.col_values(1))
+            self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
+            return title, row_idx
+
+    def find_last_row_if_matches(self, row_payload: dict[str, Any], review_needed: bool) -> Optional[tuple[str, int]]:
+        # The HTTP call can die after Google already wrote the row (seen as
+        # ConnectionAbortedError 10053). Retrying blindly then writes it twice.
+        with self._lock:
+            title = self._target_sheet(review_needed)
+            worksheet = self._worksheets_by_title[title]
+            row_idx = len(worksheet.col_values(1))
+            if row_idx < 2:
+                return None
+            cells = worksheet.row_values(row_idx)
+            expected = build_sink_row_values(row_payload)
+            if not sink_row_values_match(expected, cells):
+                return None
             self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
             return title, row_idx
 
@@ -6621,12 +6696,17 @@ def process_item(
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
 
-        # Dedup check disabled per user request to allow duplicates if the client sends the same screenshot twice.
-        # if db.receipt_sha_exists_other(digest, item.file_id, client):
-        #     db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
-        #     db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA")
-        #     print(f"[DEDUP] {path.name} | duplicate_image_sha | skipped")
-        #     return
+        # A client re-sending the same screenshot hours later is allowed (2026-07-16
+        # request). What is NOT allowed is the same bytes landing twice within a
+        # short window: that is the MsgAttach .dat and the Temp .jpg of ONE message
+        # arriving through the direct_image and db_image lanes (msg_svr_id dedup
+        # misses it because the first pass had no msg id), or WeChat materialising
+        # the same picture under two names. Both were producing duplicated rows.
+        if db.receipt_sha_exists_recent(digest, item.file_id, client, window_seconds=IMAGE_SHA_DEDUP_WINDOW_SECONDS):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="DUPLICATE_SHA_RECENT")
+            db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA_RECENT")
+            print(f"[DEDUP] {path.name} | imagem_identica_ha_menos_de_{IMAGE_SHA_DEDUP_WINDOW_SECONDS}s | cliente={client}")
+            return
 
         # PDFs are the exception: a bank PDF is a fixed document, so identical
         # bytes from the same client are the client re-sending the same receipt
@@ -7014,6 +7094,18 @@ def flush_ready_sink_rows(
             sheet, row = sink.append(claimed["row_payload"], review_needed=bool(claimed["review_needed"]))
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
+            recovered: Optional[tuple[str, int]] = None
+            try:
+                recovered = sink.find_last_row_if_matches(claimed["row_payload"], review_needed=bool(claimed["review_needed"]))
+            except Exception as probe_exc:
+                print(f"[SINK] probe_failed | file_id={file_id} | err={type(probe_exc).__name__}: {probe_exc}")
+            if recovered is not None and not db.sheet_row_already_claimed(recovered[0], recovered[1]):
+                # Google wrote the row, only the response was lost.
+                sheet, row = recovered
+                db.mark_receipt_sink_committed(file_id, sheet, row, committed_at=time.time())
+                committed += 1
+                print(f"[SINK] committed_after_error | file_id={file_id} | msg={msg_svr_id} | talker={talker} | sheet={sheet} | row={row} | err={err}")
+                continue
             db.mark_receipt_sink_retry(file_id, err, delay_sec=cfg.retry_base_seconds)
             print(f"[SINK] retry | file_id={file_id} | msg={msg_svr_id} | talker={talker} | err={err}")
             break
