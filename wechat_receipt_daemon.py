@@ -934,6 +934,36 @@ IGNORED_SENDER_USERNAMES = {
     "wxid_5sd4qzz1lyhl12",
     "jinshuo2004",
 }
+# Groups where an otherwise ignored sender forwards real client receipts, so
+# their images must be read normally there.
+IGNORED_SENDER_ALLOWED_TALKERS = {
+    "wxid_wml3ftd6qpea12": {"26151116744@chatroom"},  # Arthur Shelby no Grupo303-Jardel
+}
+
+# Pasting or screenshotting an image into the chat box makes WeChat write it to
+# FileStorage\Temp as "<epoch ms>.jpg" (or "<epoch ms>(1).jpg") before sending.
+# Received images land in Temp as "<md5>_.jpg" instead, so a numeric name is
+# always the operator's own outgoing image (fechamentos, own receipts).
+OUTGOING_PASTE_NAME_PATTERN = re.compile(r"\d{10,14}(?:\(\d+\))?\.(?:jpe?g|png)", re.IGNORECASE)
+# After sending, the same bytes also land in the group's MsgAttach folder. When
+# the DB index has not caught up yet there is no IsSender to look at, so the
+# twin is recognised by the hash of the pasted copy seen moments before.
+OUTGOING_TWIN_WINDOW_SECONDS = 30 * 60
+OUTGOING_NOTES = ("IGNORED_OUTGOING", "IGNORED_OUTGOING_PASTE", "IGNORED_OUTGOING_TWIN")
+# Real receipts measured up to ~5.8 (height / width, 4000 committed receipts);
+# fechamento lists exported from the spreadsheet are 1602 px wide and 8x-14x
+# tall. Downscaled for OCR their table header becomes illegible, the list check
+# never fires and the footer TOTAL was being posted as one receipt.
+TALL_LIST_ASPECT_RATIO = 7.0
+
+
+def is_outgoing_paste_path(path: Path) -> bool:
+    return path.parent.name.lower() == "temp" and bool(OUTGOING_PASTE_NAME_PATTERN.fullmatch(path.name))
+
+
+def is_tall_list_image(img: Image.Image) -> bool:
+    width, height = img.size
+    return width > 0 and height / width >= TALL_LIST_ASPECT_RATIO
 
 
 def normalize_text_for_match(value: str) -> str:
@@ -987,6 +1017,8 @@ def should_ignore_sender(msg_ref: Optional["WeChatMessageRef"]) -> bool:
         return False
     sender = str(msg_ref.sender_user_name or "").strip().lower()
     talker = str(msg_ref.talker or "").strip().lower()
+    if talker in IGNORED_SENDER_ALLOWED_TALKERS.get(sender, ()):
+        return False
     return sender in IGNORED_SENDER_USERNAMES or talker in IGNORED_SENDER_USERNAMES
 
 
@@ -1907,6 +1939,9 @@ class WeChatMessageRef:
     thumb_rel_path: Optional[str]
     image_abs_path: Optional[Path]
     thumb_abs_path: Optional[Path]
+    # MSG.IsSender=1: the operator sent this image (fechamentos, own receipts);
+    # it is never a client receipt.
+    is_sender: bool = False
 
     def preferred_context_path(self) -> Optional[Path]:
         if self.image_abs_path is not None:
@@ -2676,7 +2711,7 @@ class WeChatDBResolver:
         try:
             rows = conn.execute(
                 """
-                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra, IsSender
                 FROM MSG
                 WHERE Type=3
                   AND CreateTime BETWEEN ? AND ?
@@ -2704,6 +2739,7 @@ class WeChatDBResolver:
                     thumb_rel_path=thumb_rel,
                     image_abs_path=self._absolute_path_from_rel(image_rel),
                     thumb_abs_path=self._absolute_path_from_rel(thumb_rel),
+                    is_sender=bool(row["IsSender"]),
                 )
             )
         return out
@@ -2977,7 +3013,7 @@ class WeChatDBResolver:
         try:
             rows = conn.execute(
                 """
-                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra
+                SELECT MsgSvrID, StrTalker, CreateTime, BytesExtra, IsSender
                 FROM MSG
                 WHERE Type=3
                   AND StrTalker=?
@@ -3006,6 +3042,7 @@ class WeChatDBResolver:
                     thumb_rel_path=thumb_rel,
                     image_abs_path=self._absolute_path_from_rel(image_rel),
                     thumb_abs_path=self._absolute_path_from_rel(thumb_rel),
+                    is_sender=bool(row["IsSender"]),
                 )
             )
         return out
@@ -4398,6 +4435,25 @@ class StateDB:
                 LIMIT 1
                 """,
                 (sha256, str(exclude_file_id), str(client or ""), float(since)),
+            ).fetchone()
+            return row is not None
+
+    def outgoing_sha_seen_recent(self, sha256: str, exclude_file_id: str, window_seconds: float) -> bool:
+        """True if byte-identical content was recently dropped as the operator's
+        own outgoing image (the pasted Temp copy of the same send)."""
+        if not sha256:
+            return False
+        since = time.time() - float(window_seconds)
+        placeholders = ",".join("?" for _ in OUTGOING_NOTES)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT 1 FROM files
+                WHERE sha256=? AND file_id<>? AND processed_at>=?
+                  AND last_error IN ({placeholders})
+                LIMIT 1
+                """,
+                (sha256, str(exclude_file_id), float(since), *OUTGOING_NOTES),
             ).fetchone()
             return row is not None
 
@@ -6575,6 +6631,12 @@ def process_item(
                 return
             raise FileNotFoundError(f"Resolved file disappeared: {path}")
 
+        if resolution.msg_ref is not None and resolution.msg_ref.is_sender:
+            db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="IGNORED_OUTGOING")
+            db.mark_message_job_resolved(msg_svr_id, note="IGNORED_OUTGOING")
+            print(f"[SKIP] {path.name} | enviado_pelo_operador | talker={resolution.msg_ref.talker or '-'}")
+            return
+
         if should_ignore_sender(resolution.msg_ref):
             sender_label = (
                 resolution.msg_ref.sender_display
@@ -6696,6 +6758,20 @@ def process_item(
         open_ms = perf_duration_ms(open_started_at)
         digest = sha256_bytes(img_bytes)
 
+        # The operator's own sends: the pasted Temp copy is recognised by name,
+        # and its MsgAttach twin by hash when the DB has no IsSender for it yet.
+        # The digest is stored on the pasted copy so the twin can find it.
+        if item.source_kind == "temp_image" and is_outgoing_paste_path(Path(item.path)):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="IGNORED_OUTGOING_PASTE")
+            db.mark_message_job_resolved(msg_svr_id, note="IGNORED_OUTGOING_PASTE")
+            print(f"[SKIP] {Path(item.path).name} | imagem_colada_pelo_operador")
+            return
+        if db.outgoing_sha_seen_recent(digest, item.file_id, window_seconds=OUTGOING_TWIN_WINDOW_SECONDS):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="IGNORED_OUTGOING_TWIN")
+            db.mark_message_job_resolved(msg_svr_id, note="IGNORED_OUTGOING_TWIN")
+            print(f"[SKIP] {path.name} | copia_de_imagem_enviada_pelo_operador")
+            return
+
         # A client re-sending the same screenshot hours later is allowed (2026-07-16
         # request). What is NOT allowed is the same bytes landing twice within a
         # short window: that is the MsgAttach .dat and the Temp .jpg of ONE message
@@ -6717,6 +6793,12 @@ def process_item(
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="DUPLICATE_PDF_SHA")
             db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_PDF_SHA")
             print(f"[DEDUP] {path.name} | pdf_identico_ja_lancado | cliente={client}")
+            return
+
+        if pdf_text is None and video_text is None and is_tall_list_image(img):
+            db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="NOT_RECEIPT:TALL_LIST_IMAGE")
+            db.mark_message_job_resolved(msg_svr_id, note="NOT_RECEIPT:TALL_LIST_IMAGE")
+            print(f"[SKIP] {path.name} | not_receipt=TALL_LIST_IMAGE | size={img.size[0]}x{img.size[1]}")
             return
 
         ocr_spans: Optional[list[OCRSpan]] = None

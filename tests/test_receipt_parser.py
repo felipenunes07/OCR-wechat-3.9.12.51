@@ -21,7 +21,9 @@ from wechat_receipt_daemon import (
     candidate_initial_delay_seconds,
     hold_retry_delay_seconds,
     is_candidate,
+    is_outgoing_paste_path,
     is_stale_pdf_modify,
+    is_tall_list_image,
     looks_like_single_receipt,
     normalize_amount,
     normalize_client_label,
@@ -750,6 +752,66 @@ class SenderIgnoreTests(unittest.TestCase):
             thumb_abs_path=None,
         )
         self.assertFalse(should_ignore_sender(msg_ref))
+
+    def test_allows_ignored_sender_in_whitelisted_group(self) -> None:
+        msg_ref = WeChatMessageRef(
+            msg_svr_id="3",
+            talker="26151116744@chatroom",
+            create_time=1.0,
+            sender_user_name="wxid_wml3ftd6qpea12",
+            sender_display="Arthur Shelby",
+            image_rel_path=None,
+            thumb_rel_path=None,
+            image_abs_path=None,
+            thumb_abs_path=None,
+        )
+        self.assertFalse(should_ignore_sender(msg_ref))
+
+
+class OutgoingImageTests(unittest.TestCase):
+    def test_pasted_temp_names_are_outgoing(self) -> None:
+        temp = Path("C:/x/FileStorage/Temp")
+        self.assertTrue(is_outgoing_paste_path(temp / "1790693373436.jpg"))
+        self.assertTrue(is_outgoing_paste_path(temp / "1790633376540(1).jpg"))
+        self.assertTrue(is_outgoing_paste_path(temp / "1786647433901.png"))
+
+    def test_received_temp_and_msgattach_names_are_not_outgoing(self) -> None:
+        self.assertFalse(is_outgoing_paste_path(Path("C:/x/FileStorage/Temp/ce0278dbb0e3e0d7df94211ab967f604_.jpg")))
+        self.assertFalse(is_outgoing_paste_path(Path("C:/x/FileStorage/Temp/MM_WeChat_Image.dat")))
+        self.assertFalse(
+            is_outgoing_paste_path(Path("C:/x/FileStorage/MsgAttach/abc/Image/2026-09/1790693373436.jpg"))
+        )
+
+    def test_msgattach_twin_of_pasted_image_is_detected_by_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            pasted = root / "FileStorage" / "Temp" / "1790693373436.jpg"
+            pasted.parent.mkdir(parents=True)
+            Image.new("RGB", (16, 16), "white").save(pasted)
+            db = StateDB(root / "state.db")
+            try:
+                file_id = db.upsert_candidate(
+                    pasted, settle_seconds=1, source_event="created", thumb_candidates_enabled=False
+                )
+                self.assertIsNotNone(file_id)
+                db.mark_done(file_id, sha256="sha-colada", processed_at=time.time(), note="IGNORED_OUTGOING_PASTE")
+
+                self.assertTrue(db.outgoing_sha_seen_recent("sha-colada", "twin", window_seconds=1800))
+                self.assertFalse(db.outgoing_sha_seen_recent("sha-colada", file_id, window_seconds=1800))
+                self.assertFalse(db.outgoing_sha_seen_recent("sha-cliente", "twin", window_seconds=1800))
+            finally:
+                db.close()
+
+
+class TallListImageTests(unittest.TestCase):
+    def test_spreadsheet_list_exports_are_rejected(self) -> None:
+        self.assertTrue(is_tall_list_image(Image.new("RGB", (1602, 14670))))
+        self.assertTrue(is_tall_list_image(Image.new("RGB", (1602, 21774))))
+
+    def test_long_real_receipts_are_kept(self) -> None:
+        self.assertFalse(is_tall_list_image(Image.new("RGB", (270, 1565))))  # 5.8x, longest real one
+        self.assertFalse(is_tall_list_image(Image.new("RGB", (1834, 6305))))  # Caixa Pix
+        self.assertFalse(is_tall_list_image(Image.new("RGB", (1080, 2400))))
 
 
 def build_receipt_payload(
