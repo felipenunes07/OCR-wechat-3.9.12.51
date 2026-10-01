@@ -2073,6 +2073,13 @@ class WeChatDBResolver:
         # the daemon looks healthy. Past this many seconds the attempt is
         # declared wedged and a fresh one is allowed through.
         self.merge_stall_seconds = 300
+        # Rebuilding the ~500 MB index every refresh while WeChat had written
+        # nothing kept the disk (and the antivirus scanning each new file) busy
+        # for no gain. The signature of the source shards tells whether there is
+        # anything new; unchanged_max_skip_seconds bounds how long that is trusted.
+        self.unchanged_max_skip_seconds = 60
+        self._merged_signature: Optional[tuple] = None
+        self._last_full_merge = 0.0
         self._newest_msg_cache: tuple[float, float] = (0.0, 0.0)  # (merge_mtime, newest_create_time)
         self._sweep_orphan_merge_tmps()
         self._load_dependencies()
@@ -2371,6 +2378,9 @@ class WeChatDBResolver:
                 decrypted[0].replace(target_path)
                 conn = sqlite3.connect(str(target_path))
                 try:
+                    # The file being built is a throwaway until the swap, so
+                    # waiting on fsync buys nothing (the commit alone took 12 s).
+                    conn.execute("PRAGMA synchronous=OFF")
                     # localId is the INTEGER PRIMARY KEY and WeChat restarts it at
                     # 1 in every new shard, so "INSERT OR IGNORE ... SELECT *"
                     # collided on every single row of MSG1 and silently dropped
@@ -2477,6 +2487,25 @@ class WeChatDBResolver:
             )
         return bool(payload.get("code")), str(payload.get("ret"))
 
+    def _source_signature(self) -> Optional[tuple]:
+        if self._wx_dir is None:
+            return None
+        multi_dir = self._wx_dir / "Msg" / "Multi"
+        sig = []
+        try:
+            for shard in sorted(multi_dir.glob("MSG*.db"), key=lambda p: p.name):
+                if not re.fullmatch(r"msg\d+\.db", shard.name.lower()):
+                    continue
+                for part in (shard, shard.with_name(shard.name + "-wal")):
+                    try:
+                        st = part.stat()
+                        sig.append((part.name.lower(), st.st_size, st.st_mtime_ns))
+                    except FileNotFoundError:
+                        sig.append((part.name.lower(), -1, -1))
+        except OSError:
+            return None
+        return tuple(sig) if sig else None
+
     def _mark_refresh_failure(self, now: float, detail: str) -> bool:
         self._last_failure = now
         self._last_error = detail
@@ -2530,7 +2559,9 @@ class WeChatDBResolver:
         if removed:
             print(f"[RESOLVER] limpeza: {removed} tmp orfaos removidos ({freed / (1024 ** 3):.2f} GB)")
 
-    def _run_background_merge(self, started_at: float, force: bool, seq: int = 0) -> None:
+    def _run_background_merge(
+        self, started_at: float, force: bool, seq: int = 0, source_sig: Optional[tuple] = None
+    ) -> None:
         # One tmp file per attempt: a wedged attempt that wakes up later must
         # not write into the file the current attempt is building.
         tmp_merge_path = self.merge_path.with_suffix(f".db.tmp{seq or ''}")
@@ -2578,6 +2609,8 @@ class WeChatDBResolver:
                         self._last_refresh = time.time()
                         self._last_failure = 0.0
                         self._last_error = None
+                        self._merged_signature = source_sig
+                        self._last_full_merge = self._last_refresh
                     else:
                         print(f"[RESOLVER] swap_falhou: {swap_err[:200]}")
                         self._mark_refresh_failure(time.time(), swap_err)
@@ -2635,11 +2668,26 @@ class WeChatDBResolver:
                     self._last_failure = now
                     return self.merge_path.exists()
 
+                # Taken before the merge reads the shards: anything WeChat
+                # writes while it runs changes the signature and triggers the
+                # next merge.
+                source_sig = self._source_signature()
+                if (
+                    not force
+                    and source_sig is not None
+                    and source_sig == self._merged_signature
+                    and self._last_error is None
+                    and self.merge_path.exists()
+                    and (now - self._last_full_merge) < self.unchanged_max_skip_seconds
+                ):
+                    self._last_refresh = now
+                    return True
+
                 self._merge_seq += 1
                 self._merge_started_at = now
                 self._merge_thread = threading.Thread(
                     target=self._run_background_merge,
-                    args=(now, force, self._merge_seq),
+                    args=(now, force, self._merge_seq, source_sig),
                     daemon=True
                 )
                 self._merge_thread.start()
@@ -3135,6 +3183,9 @@ class StateDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_files_status_next ON files(status, next_attempt);
                 CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+                -- outgoing_sha_seen_recent runs once per receipt; without this it
+                -- scanned the whole table (13 s under disk pressure, 01/10/2026).
+                CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
 
                 CREATE TABLE IF NOT EXISTS receipts (
                     file_id TEXT PRIMARY KEY,
@@ -4634,7 +4685,7 @@ class StateDB:
                 FROM receipts AS r
                 LEFT JOIN files AS f
                   ON f.file_id = r.file_id
-                WHERE COALESCE(r.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
+                WHERE r.sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
                   AND COALESCE(r.sheet_next_attempt, 0) <= ?
                 ORDER BY
                     CASE
@@ -4709,7 +4760,7 @@ class StateDB:
                             SELECT r2.file_id
                             FROM receipts AS r2
                             JOIN files AS f2 ON f2.file_id = r2.file_id
-                            WHERE COALESCE(r2.sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                            WHERE r2.sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
                               AND r2.file_id <> ?
                               AND COALESCE(f2.mtime, 0) > 0
                               AND f2.mtime < ?
@@ -4856,7 +4907,7 @@ class StateDB:
                     """
                     SELECT COUNT(*)
                     FROM receipts
-                    WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                    WHERE sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
                       AND ingested_at < ?
                     """,
                     (float(older_than_ingested_at),),
@@ -4870,7 +4921,7 @@ class StateDB:
                 SET sheet_status='SINK_SKIPPED_TERMINAL',
                     sheet_next_attempt=0,
                     sheet_last_error='IGNORED_STARTUP_BACKLOG'
-                WHERE COALESCE(sheet_status, '') IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
+                WHERE sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
                   AND ingested_at < ?
                 """,
                 (float(older_than_ingested_at),),
@@ -5884,8 +5935,21 @@ def reconcile_scan(cfg: Config, db: StateDB) -> int:
                     # Ignore any other subdirectory branches
                     dirnames[:] = []
 
-            for f in filenames:
-                p = Path(dirpath) / f
+            # os.scandir hands back the mtime Windows already read with the
+            # directory listing. Asking each of the tens of thousands of old
+            # files for is_file()/stat() cost one syscall apiece and held the
+            # main loop for ~25 s per sweep -- receipts opened meanwhile waited.
+            try:
+                entries = list(os.scandir(dirpath))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file() or float(entry.stat().st_mtime) < scan_floor:
+                        continue
+                except OSError:
+                    continue
+                p = Path(entry.path)
                 if not is_candidate(p, thumb_candidates_enabled=cfg.thumb_candidates_enabled):
                     continue
                 try:
