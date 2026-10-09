@@ -2243,6 +2243,44 @@ class ContinuationDetectionTests(unittest.TestCase):
         self.assertEqual(fields["amount"], 185.0)
 
 
+    def test_beneficiary_words_are_not_a_pix_id(self) -> None:
+        from wechat_receipt_daemon import extract_pix_transaction_ids
+
+        # Real regression 08/10/2026 (client 168): the loose "E + 31 alnum"
+        # pattern read CLEEND's name as an id shared by every CLEEND receipt,
+        # so an unreadable FAMEX print was dropped as a "continuation".
+        texto = "Dados de quem recebeu\nNome: CLEEND INTERMEDIACAO E ATACADO LTDA\nCNPJ: 61.964.978/0001-68"
+        self.assertEqual(extract_pix_transaction_ids(texto), set())
+        self.assertEqual(
+            extract_pix_transaction_ids("Identificacao: E60746948202610052117I0478kljm44"),
+            {"E60746948202610052117I0478KLJM44"},
+        )
+
+
+class DescreenFallbackTests(unittest.TestCase):
+    class _FakeOCR:
+        def __init__(self, texts: list[str]) -> None:
+            self._texts = list(texts)
+
+        def extract(self, img: Image.Image) -> tuple[str, float]:
+            return self._texts.pop(0), 0.9
+
+    def test_agreeing_reads_recover_the_value(self) -> None:
+        from wechat_receipt_daemon import read_descreened_receipt
+
+        ocr = self._FakeOCR(["Valor:Rs2882,17\nPix", "Valor:Rs2882.17\nPix"])
+        got = read_descreened_receipt(Image.new("RGB", (200, 200), "white"), ocr)
+        self.assertIsNotNone(got)
+        self.assertEqual(got[2], 2882.17)
+
+    def test_disagreeing_or_missing_reads_never_guess(self) -> None:
+        from wechat_receipt_daemon import read_descreened_receipt
+
+        img = Image.new("RGB", (200, 200), "white")
+        self.assertIsNone(read_descreened_receipt(img, self._FakeOCR(["Valor:Rs2882,17", "Valor:Rs2862,17"])))
+        self.assertIsNone(read_descreened_receipt(img, self._FakeOCR(["MalorRs3os3S3", "Valor:Rs3053,93"])))
+
+
 class NoAmountNeverCommitsTests(unittest.TestCase):
     def test_amountless_parse_is_never_staged(self) -> None:
         from wechat_receipt_daemon import should_stage_receipt

@@ -1335,8 +1335,12 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
     return (True, "OK")
 
 
-# Pix end-to-end id: "E" + 31 alphanumeric chars (ISPB + date + sequence).
-PIX_E2E_ID_PATTERN = re.compile(r"E[0-9A-Za-z]{31}")
+# Pix end-to-end id: "E" + 8-digit ISPB + yyyyMMddHHmm + 11 alphanumeric chars.
+# The digit blocks are required: a loose "E + 31 alnum" matched plain words
+# glued by compaction ("EENDINTERMEDIACAOEATACADOLTDACNP" from CLEEND's name),
+# so every no-value print of a CLEEND receipt was silently swallowed as a
+# "continuation" of an unrelated receipt (client 168, 08/10/2026).
+PIX_E2E_ID_PATTERN = re.compile(r"E\d{8}20\d{10}[0-9A-Za-z]{11}")
 
 
 def extract_pix_transaction_ids(text: str) -> set[str]:
@@ -1758,6 +1762,33 @@ def prepare_image_for_ocr(img: Image.Image, source_kind: str) -> Image.Image:
     gray = gray.filter(ImageFilter.MedianFilter(size=3))
     gray = gray.filter(ImageFilter.SHARPEN)
     return gray.convert("RGB")
+
+
+def read_descreened_receipt(img: Image.Image, ocr: "OCREngine") -> Optional[tuple[str, float, float]]:
+    """Re-read a phone photo of a monitor whose value the plain pass lost.
+
+    The moire stripes of a photographed screen garble the digits ("Valor: R$
+    2882,17" -> "MalorRS288217", "R$ 3053,93" -> "MalorRs3os3S3"; client 168,
+    08/10/2026). Blurring or halving the image removes the stripes. Two
+    independent passes must parse the SAME amount -- otherwise None, and the
+    receipt stays an exception instead of getting a guessed value.
+    """
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    variants = (
+        rgb.convert("L").filter(ImageFilter.GaussianBlur(1.5)).convert("RGB"),
+        rgb.resize((max(1, w // 2), max(1, h // 2)), LANCZOS_FILTER),
+    )
+    reads: list[tuple[str, float, float]] = []
+    for variant in variants:
+        text, conf = ocr.extract(variant)
+        amount = parse_receipt_fields(text, ocr_conf=conf, q_score=1.0).get("amount")
+        if amount is None:
+            return None
+        reads.append((text, conf, float(amount)))
+    if abs(reads[0][2] - reads[1][2]) > 0.005:
+        return None
+    return max(reads, key=lambda r: r[1])
 
 
 def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str, Any]:
@@ -7035,6 +7066,23 @@ def process_item(
                     ocr_chars = len(text)
                     is_receipt = raw_is_receipt
                     receipt_reason = raw_receipt_reason
+
+        if (
+            is_receipt
+            and pdf_text is None
+            and video_text is None
+            and parse_receipt_fields(text, ocr_conf=ocr_conf, q_score=q_score).get("amount") is None
+        ):
+            descreen_started_at = time.perf_counter()
+            descreened = read_descreened_receipt(img, ocr)
+            descreen_ms = perf_duration_ms(descreen_started_at)
+            ocr_ms += descreen_ms
+            if descreened is not None:
+                text, ocr_conf, descreen_amount = descreened
+                ocr_chars = len(text)
+                print(f"[OCR] Descreen pass recovered value for {path.name} (valor={descreen_amount}, ms={descreen_ms})")
+            else:
+                print(f"[OCR] Descreen pass found no agreeing value for {path.name} (ms={descreen_ms})")
 
         if not is_receipt:
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
