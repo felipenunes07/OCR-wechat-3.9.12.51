@@ -1791,6 +1791,260 @@ def read_descreened_receipt(img: Image.Image, ocr: "OCREngine") -> Optional[tupl
     return max(reads, key=lambda r: r[1])
 
 
+# ---------------------------------------------------------------------------
+# Fechamento audit: the operator posts a per-client list (DATA / HORARIO /
+# BANCO / TRANSFERENCIA + TOTAL) in the group. Every value on it must be on the
+# sheet; anything missing is raised on screen right away instead of being found
+# by hand days later (client 168 FAMEX prints and 116A R$ 325, 08/10/2026).
+# ---------------------------------------------------------------------------
+FECHAMENTO_DATE_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+FECHAMENTO_TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+FECHAMENTO_TOTAL_RE = re.compile(r"^(?:R\$|RS)?\s*(\d{1,3}(?:\.\d{3})+|\d+),(\d{2})$", re.IGNORECASE)
+FECHAMENTO_MATCH_TOLERANCE = 1.0  # list values are whole reais; the sheet keeps cents
+FECHAMENTO_DATE_SLACK_DAYS = 3
+ALERTS_LOG_NAME = "ALERTAS_FECHAMENTO.txt"
+
+
+def parse_fechamento_list(text: str, client: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Rows of a fechamento list, or None when it cannot be read with certainty.
+
+    OCR returns the table cell by cell in a loose order, with the row number
+    glued before or after a row's cells. Rows are split on their date cell and
+    the parse is only trusted when the values add up to the printed TOTAL.
+    """
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    rows: list[dict[str, Any]] = []
+    cur: Optional[dict[str, Any]] = None
+    total: Optional[float] = None
+    client_key = str(client or "").strip().upper()
+    for i, line in enumerate(lines):
+        if line.upper() == "TOTAL":
+            for tail in lines[i + 1 : i + 4]:
+                m = FECHAMENTO_TOTAL_RE.match(tail.replace(" ", ""))
+                if m:
+                    total = float(f"{m.group(1).replace('.', '')}.{m.group(2)}")
+                    break
+            # The client label printed just above TOTAL is not a value.
+            if cur is not None and cur["ints"] and client_key and lines[i - 1].upper() == client_key:
+                if str(cur["ints"][-1]) == client_key and len(cur["ints"]) > 1:
+                    cur["ints"].pop()
+            break
+        dm = FECHAMENTO_DATE_RE.match(line)
+        if dm:
+            if cur is not None:
+                rows.append(cur)
+            cur = {"date": line, "time": None, "bank": None, "ints": []}
+            continue
+        if cur is None:
+            continue
+        if FECHAMENTO_TIME_RE.match(line):
+            cur["time"] = cur["time"] or line
+        elif line.isdigit():
+            cur["ints"].append(int(line))
+        elif line.isalpha() and cur["bank"] is None:
+            cur["bank"] = line.upper()
+    if cur is not None:
+        rows.append(cur)
+    if not rows or total is None:
+        return None
+
+    for n, row in enumerate(rows, start=1):
+        ints = row.pop("ints")
+        # Row numbers: the next row's number trails this row, its own leads it.
+        if len(ints) > 1 and ints[-1] == n + 1:
+            ints.pop()
+        if len(ints) > 1 and ints[0] == n:
+            ints.pop(0)
+        if len(ints) != 1:
+            return None
+        row["amount"] = float(ints[0])
+    if abs(sum(r["amount"] for r in rows) - total) > 0.5:
+        return None
+    return {"rows": rows, "total": total}
+
+
+def parse_sheet_money(value: Any) -> Optional[float]:
+    s = str(value or "").strip().upper().replace("R$", "").replace(" ", "")
+    if not s:
+        return None
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _fechamento_date(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(value or "").strip()[:10], "%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def find_missing_fechamento_rows(
+    rows: list[dict[str, Any]],
+    launched: list[tuple[Optional[str], Optional[float]]],
+    date_slack_days: int = FECHAMENTO_DATE_SLACK_DAYS,
+) -> list[dict[str, Any]]:
+    """List rows with no launched (date, amount) counterpart; each launch is used once."""
+    pool = [(d, a) for d, a in launched if a is not None]
+    used = [False] * len(pool)
+    unmatched: list[dict[str, Any]] = []
+    # Same-date matches first, so a value repeated on several days pairs correctly.
+    for row in rows:
+        hit = next(
+            (
+                k for k, (d, a) in enumerate(pool)
+                if not used[k] and abs(a - row["amount"]) <= FECHAMENTO_MATCH_TOLERANCE and str(d or "")[:10] == row["date"]
+            ),
+            None,
+        )
+        if hit is None:
+            unmatched.append(row)
+        else:
+            used[hit] = True
+    missing: list[dict[str, Any]] = []
+    for row in unmatched:
+        row_day = _fechamento_date(row["date"])
+        hit = None
+        for k, (d, a) in enumerate(pool):
+            if used[k] or abs(a - row["amount"]) > FECHAMENTO_MATCH_TOLERANCE:
+                continue
+            day = _fechamento_date(d)
+            if row_day is not None and day is not None and abs((day - row_day).days) <= date_slack_days:
+                hit = k
+                break
+        if hit is None:
+            missing.append(row)
+        else:
+            used[hit] = True
+    return missing
+
+
+def ocr_tall_image_in_strips(img: Image.Image, ocr: "OCREngine") -> str:
+    """OCR a long list export in full-width strips cut on blank bands.
+
+    A 1602x12000 list shrunk to fit one OCR pass becomes unreadable, and a cut
+    through a row would lose it (and break the TOTAL check), so each cut is
+    moved to the flattest pixel row near its target.
+    """
+    gray = img.convert("L")
+    w, h = gray.size
+    step = max(400, w)
+    texts: list[str] = []
+    top = 0
+    while top < h:
+        bottom = min(h, top + step)
+        if bottom < h:
+            lo, hi = max(top + step // 2, bottom - 200), min(h - 1, bottom + 200)
+            best, best_dev = bottom, None
+            for y in range(lo, hi, 2):
+                dev = ImageStat.Stat(gray.crop((0, y, w, y + 1))).stddev[0]
+                if best_dev is None or dev < best_dev:
+                    best, best_dev = y, dev
+                    if dev < 1.0:
+                        break
+            bottom = best
+        strip_text, _conf = ocr.extract(img.crop((0, top, w, bottom)).convert("RGB"))
+        texts.append(strip_text)
+        top = bottom
+    return "\n".join(texts)
+
+
+def raise_operator_alert(title: str, message: str) -> None:
+    """Log, persist and pop up an alert the operator cannot miss."""
+    print(f"[ALERTA] {title} | {message.replace(chr(10), ' / ')}")
+    try:
+        log_path = Path(__file__).resolve().parent / ALERTS_LOG_NAME
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%d/%m/%Y %H:%M:%S}] {title}\n{message}\n\n")
+    except Exception as exc:
+        print(f"[WARN] alert_log_failed | err={exc}")
+    if os.name != "nt" or os.environ.get("WECHAT_OCR_NO_POPUP"):
+        return
+
+    def _popup() -> None:
+        try:
+            import ctypes
+
+            # MB_ICONWARNING | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x30 | 0x1000 | 0x10000 | 0x40000)
+        except Exception as exc:
+            print(f"[WARN] alert_popup_failed | err={exc}")
+
+    threading.Thread(target=_popup, name="operator-alert", daemon=True).start()
+
+
+def audit_fechamento(
+    *,
+    text: Optional[str],
+    img: Optional[Image.Image],
+    digest: str,
+    client: Optional[str],
+    db: "StateDB",
+    sink: "RowSink",
+    ocr: "OCREngine",
+    source_name: str,
+) -> None:
+    """Compare a posted fechamento list with what reached the sheet. Never raises."""
+    try:
+        if not client or not digest:
+            return
+        meta_key = f"fechamento_audit:{digest}"
+        if db.get_meta(meta_key) is not None:
+            return
+        if text is None:
+            if img is None:
+                return
+            text = ocr_tall_image_in_strips(img, ocr) if is_tall_list_image(img) else ocr.extract(
+                prepare_image_for_ocr(img, "msgattach_dat")
+            )[0]
+        low = strip_accents(text.lower())
+        if "total" not in low or "transfer" not in low:
+            return
+        parsed = parse_fechamento_list(text, client)
+        if parsed is None:
+            db.set_meta(meta_key, "ILEGIVEL")
+            print(f"[FECHAMENTO] {source_name} | cliente={client} | lista_ilegivel_soma_nao_bate")
+            return
+
+        launched: Optional[list[tuple[Optional[str], Optional[float]]]] = None
+        sheet_rows = sink.read_client_rows(client)
+        if sheet_rows is not None:
+            launched = [(d, parse_sheet_money(v)) for d, v in sheet_rows]
+        # Receipts still on their way to the sheet count as launched.
+        pending = db.list_client_receipts_since(client, time.time() - 15 * 86400, uncommitted_only=sheet_rows is not None)
+        launched = (launched or []) + pending
+
+        missing = find_missing_fechamento_rows(parsed["rows"], launched)
+        db.set_meta(meta_key, f"FALTANDO={len(missing)}")
+        print(
+            f"[FECHAMENTO] {source_name} | cliente={client} | linhas={len(parsed['rows'])} "
+            f"| total={parsed['total']:.2f} | faltando={len(missing)} | fonte={'planilha' if sheet_rows is not None else 'db'}"
+        )
+        if missing:
+            # Tell "never launched" apart from "launched, then removed from the sheet".
+            never = missing
+            if sheet_rows is not None:
+                never = find_missing_fechamento_rows(
+                    parsed["rows"], db.list_client_receipts_since(client, time.time() - 15 * 86400), date_slack_days=1
+                )
+            lines = [
+                f"  {r['date']} {r['time'] or '--:--'}  {r['bank'] or '-'}  R$ {r['amount']:,.0f}".replace(",", ".")
+                + ("  (nunca lancado)" if any(r is n for n in never) else "  (foi lancado, mas APAGARAM da planilha)")
+                for r in missing
+            ]
+            raise_operator_alert(
+                f"FALTA NA PLANILHA - cliente {client}",
+                f"O fechamento do cliente {client} tem {len(missing)} valor(es) que NAO estao na planilha:\n\n"
+                + "\n".join(lines)
+                + "\n\nConfira os comprovantes no grupo e lance o que faltar.",
+            )
+    except Exception as exc:
+        print(f"[WARN] fechamento_audit_failed | {source_name} | err={type(exc).__name__}: {exc}")
+
+
 def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str, Any]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     raw = "\n".join(lines)
@@ -4388,6 +4642,17 @@ class StateDB:
             row = self._conn.execute("SELECT 1 FROM receipts WHERE msg_svr_id=? LIMIT 1", (str(msg_svr_id),)).fetchone()
             return row is not None
 
+    def list_client_receipts_since(
+        self, client: str, since_ts: float, uncommitted_only: bool = False
+    ) -> list[tuple[Optional[str], Optional[float]]]:
+        """(txn_date, amount) of this client's valued receipts ingested since since_ts."""
+        sql = "SELECT txn_date, amount FROM receipts WHERE UPPER(client) = ? AND ingested_at > ? AND amount IS NOT NULL"
+        if uncommitted_only:
+            sql += " AND COALESCE(sheet_status, '') NOT IN ('SINK_COMMITTED', 'SINK_SKIPPED_TERMINAL')"
+        with self._lock:
+            rows = self._conn.execute(sql, (str(client or "").strip().upper(), float(since_ts))).fetchall()
+        return [(r[0], float(r[1])) for r in rows]
+
     def find_recent_valued_receipts(self, since_ts: float, limit: int = 300) -> list[tuple[Optional[str], Optional[str], str]]:
         """Recent receipts WITH a value: (talker, client, ocr_text).
 
@@ -5565,6 +5830,12 @@ class RowSink:
         to look back simply return None and the caller retries as before."""
         return None
 
+    def read_client_rows(self, client: str) -> Optional[list[tuple[str, str]]]:
+        """(DATA, VALOR) of every row of this client currently on the sheet, or
+        None when the sink cannot read itself back (the caller then falls back
+        to the state DB)."""
+        return None
+
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
         raise NotImplementedError
 
@@ -5810,6 +6081,22 @@ class GoogleSheetsSink(RowSink):
                 return None
             self._apply_row_highlight(worksheet, row_idx, sheet_row_color(row_payload))
             return title, row_idx
+
+    def read_client_rows(self, client: str) -> Optional[list[tuple[str, str]]]:
+        # Read what is on the sheet NOW: a row deleted by hand after it was
+        # committed must count as missing (116A R$ 325, 08/10/2026).
+        key = str(client or "").strip().upper()
+        rows: list[tuple[str, str]] = []
+        with self._lock:
+            titles = {self._target_sheet(False), self._target_sheet(True)}
+            for title in titles:
+                worksheet = self._worksheets_by_title.get(title)
+                if worksheet is None:
+                    continue
+                for cells in worksheet.get_all_values()[1:]:
+                    if len(cells) >= 5 and str(cells[0]).strip().upper() == key:
+                        rows.append((str(cells[1]).strip(), str(cells[4]).strip()))
+        return rows
 
     def update_row(self, sheet_name: str, row_idx: int, row_payload: dict[str, Any], review_needed: bool) -> None:
         with self._lock:
@@ -6727,6 +7014,21 @@ def process_item(
             raise FileNotFoundError(f"Resolved file disappeared: {path}")
 
         if resolution.msg_ref is not None and resolution.msg_ref.is_sender:
+            if path.suffix.lower() != ".pdf":
+                try:
+                    out_img, out_bytes, _ext, _key = open_image_from_file(path)
+                    audit_fechamento(
+                        text=None,
+                        img=out_img,
+                        digest=sha256_bytes(out_bytes),
+                        client=resolver.resolve(resolution.client_source_path),
+                        db=db,
+                        sink=sink,
+                        ocr=ocr,
+                        source_name=path.name,
+                    )
+                except Exception as exc:
+                    print(f"[WARN] fechamento_audit_open_failed | {path.name} | err={type(exc).__name__}: {exc}")
             db.mark_done(item.file_id, sha256="", processed_at=time.time(), note="IGNORED_OUTGOING")
             db.mark_message_job_resolved(msg_svr_id, note="IGNORED_OUTGOING")
             print(f"[SKIP] {path.name} | enviado_pelo_operador | talker={resolution.msg_ref.talker or '-'}")
@@ -6891,6 +7193,9 @@ def process_item(
             return
 
         if pdf_text is None and video_text is None and is_tall_list_image(img):
+            audit_fechamento(
+                text=None, img=img, digest=digest, client=client, db=db, sink=sink, ocr=ocr, source_name=path.name
+            )
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="NOT_RECEIPT:TALL_LIST_IMAGE")
             db.mark_message_job_resolved(msg_svr_id, note="NOT_RECEIPT:TALL_LIST_IMAGE")
             print(f"[SKIP] {path.name} | not_receipt=TALL_LIST_IMAGE | size={img.size[0]}x{img.size[1]}")
@@ -7085,6 +7390,10 @@ def process_item(
                 print(f"[OCR] Descreen pass found no agreeing value for {path.name} (ms={descreen_ms})")
 
         if not is_receipt:
+            if receipt_reason == "TABULAR_TRANSFER_LIST":
+                audit_fechamento(
+                    text=text, img=img, digest=digest, client=client, db=db, sink=sink, ocr=ocr, source_name=path.name
+                )
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
             db.mark_message_job_resolved(msg_svr_id, note=f"NOT_RECEIPT:{receipt_reason}")
             print(f"[SKIP] {path.name} | not_receipt={receipt_reason}")
@@ -7109,7 +7418,10 @@ def process_item(
             recent_valued = db.find_recent_valued_receipts(since_ts=time.time() - 1800)
             if own_ids:
                 for r_talker, r_client, r_text in recent_valued:
-                    if own_ids & extract_pix_transaction_ids(r_text):
+                    same_conv = (talker_now and r_talker == talker_now) or (
+                        client not in (None, "", "-") and r_client == client
+                    )
+                    if same_conv and own_ids & extract_pix_transaction_ids(r_text):
                         continuation_of = "mesmo_id_pix"
                         break
             if continuation_of is None:

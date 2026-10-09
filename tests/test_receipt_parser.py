@@ -2383,5 +2383,69 @@ class MergeSwapRetryTests(unittest.TestCase):
             self.assertEqual(resolver.merge_path.read_text(encoding="utf-8"), "newer")
 
 
+# OCR of the real fechamento lists posted on 08/10/2026 (cells in OCR order).
+FECHAMENTO_168_OCR = "\n".join(
+    "DATA BANCO HORARIO TRANSFERENCIA "
+    "07/10/2026 15:43 CLEEND 2307 07/10/2026 11:45 CLEEND 246 07/10/2026 CLEEND 11:52 59 "
+    "07/10/2026 14:13 CLEEND 330 08/10/2026 8:31 CLEEND 1031 08/10/2026 18:37 CLEEND 4642 "
+    "08/10/2026 11:37 CLEEND 10141 08/10/2026 13:43 CLEEND 1167 08/10/2026 11:09 CLEEND 4460 10 "
+    "06/10/2026 18:12 CLEEND 2882 11 05/10/2026 18:18 CLEEND 3054 168 TOTAL RS 30.319,00".split()
+)
+FECHAMENTO_116A_OCR = "\n".join(
+    "DATA BANCO HORARIO TRANSFERENCIA "
+    "07/10/2026 17:31 CLEEND 2700 07/10/2026 16:51 AMD 47722 07/10/2026 16:46 AMD 9825 "
+    "07/10/2026 18:19 AMD 9500 08/10/2026 9:06 AMD 30484 08/10/2026 9:30 AMD 1825 "
+    "08/10/2026 9:32 AMD 1500 08/10/2026 11:51 AMD 4160 08/10/2026 11:44 AMD 5000 "
+    "08/10/2026 10 AMD 12:36 7630 11 08/10/2026 13:13 AMD 18400 12 08/10/2026 10:59 AMD 49500 13 "
+    "08/10/2026 AMD 11:00 48600 07/10/2026 14 15:12 AMD 5000 08/10/2026 15 AMD 325 116A TOTAL 242.171,00".split()
+)
+
+
+class FechamentoAuditTests(unittest.TestCase):
+    def test_parses_real_lists_and_checks_total(self) -> None:
+        from wechat_receipt_daemon import parse_fechamento_list
+
+        p168 = parse_fechamento_list(FECHAMENTO_168_OCR, "168")
+        self.assertIsNotNone(p168)
+        self.assertEqual(
+            [r["amount"] for r in p168["rows"]],
+            [2307, 246, 59, 330, 1031, 4642, 10141, 1167, 4460, 2882, 3054],
+        )
+        self.assertEqual(p168["rows"][9]["date"], "06/10/2026")
+        p116 = parse_fechamento_list(FECHAMENTO_116A_OCR, "116A")
+        self.assertIsNotNone(p116)
+        self.assertEqual(len(p116["rows"]), 15)
+        self.assertEqual(p116["rows"][-1]["amount"], 325)
+        self.assertEqual(p116["total"], 242171.0)
+
+    def test_total_mismatch_is_not_trusted(self) -> None:
+        from wechat_receipt_daemon import parse_fechamento_list
+
+        broken = FECHAMENTO_168_OCR.replace("\n2882\n", "\n2832\n")
+        self.assertIsNone(parse_fechamento_list(broken, "168"))
+
+    def test_missing_rows_are_found(self) -> None:
+        from wechat_receipt_daemon import find_missing_fechamento_rows, parse_fechamento_list
+
+        rows = parse_fechamento_list(FECHAMENTO_168_OCR, "168")["rows"]
+        # What was on the sheet on 08/10/2026: everything except the two FAMEX prints.
+        launched = [
+            ("07/10/2026", 2306.99), ("07/10/2026", 246.0), ("07/10/2026", 59.0), ("07/10/2026", 330.0),
+            ("06/10/2026", 1731.07), ("08/10/2026", 1030.78), ("08/10/2026", 4642.0), ("08/10/2026", 10140.63),
+            ("08/10/2026", 1166.68), ("08/10/2026", 4459.9),
+        ]
+        missing = find_missing_fechamento_rows(rows, launched)
+        self.assertEqual([(r["date"], r["amount"]) for r in missing], [("06/10/2026", 2882), ("05/10/2026", 3054)])
+        launched += [("06/10/2026", 2882.17), ("05/10/2026", 3053.93)]
+        self.assertEqual(find_missing_fechamento_rows(rows, launched), [])
+
+    def test_each_launch_covers_one_row_only(self) -> None:
+        from wechat_receipt_daemon import find_missing_fechamento_rows
+
+        rows = [{"date": "08/10/2026", "time": None, "bank": "AMD", "amount": 5000.0}] * 2
+        missing = find_missing_fechamento_rows(rows, [("08/10/2026", 5000.0)])
+        self.assertEqual(len(missing), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
