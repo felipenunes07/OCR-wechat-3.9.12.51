@@ -2447,5 +2447,72 @@ class FechamentoAuditTests(unittest.TestCase):
         self.assertEqual(len(missing), 1)
 
 
+class _AuditDB:
+    def __init__(self, receipts: list) -> None:
+        self.meta: dict = {}
+        self.receipts = receipts
+
+    def get_meta(self, key: str):
+        return self.meta.get(key)
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.meta[key] = value
+
+    def list_client_receipts_since(self, client, since_ts, uncommitted_only=False):
+        return [] if uncommitted_only else list(self.receipts)
+
+
+class _AuditSink:
+    def __init__(self, rows: list) -> None:
+        self.rows = rows
+
+    def read_client_rows(self, client):
+        return list(self.rows)
+
+
+class FechamentoAuditAlertTests(unittest.TestCase):
+    # Everything the 168 list holds, as launched (DB) / still on the sheet.
+    LAUNCHED = [
+        ("07/10/2026", 2307.0), ("07/10/2026", 246.0), ("07/10/2026", 59.0), ("07/10/2026", 330.0),
+        ("08/10/2026", 1031.0), ("08/10/2026", 4642.0), ("08/10/2026", 10141.0), ("08/10/2026", 1167.0),
+        ("08/10/2026", 4460.0), ("06/10/2026", 2882.0), ("05/10/2026", 3054.0),
+    ]
+
+    def _run(self, db, sink, posted_at):
+        import wechat_receipt_daemon as d
+
+        alerts = []
+        with patch.object(d, "raise_operator_alert", lambda title, msg: alerts.append(msg)):
+            d.audit_fechamento(
+                text=FECHAMENTO_168_OCR, img=None, digest="x", client="168", db=db, sink=sink,
+                ocr=None, source_name="lista.dat", posted_at=posted_at,
+            )
+        return alerts
+
+    def test_old_list_is_not_audited(self) -> None:
+        # 09/10/2026: lists posted at 20:45 were picked up at 11:38 the next day,
+        # after the sheet was cleared, and every row popped up as "APAGARAM".
+        db = _AuditDB(self.LAUNCHED)
+        alerts = self._run(db, _AuditSink([]), posted_at=time.time() - 15 * 3600)
+        self.assertEqual(alerts, [])
+        self.assertEqual(db.meta["fechamento_audit:x"], "ANTIGA")
+
+    def test_cleared_sheet_only_reports_never_launched(self) -> None:
+        db = _AuditDB(self.LAUNCHED)
+        self.assertEqual(self._run(db, _AuditSink([]), posted_at=time.time()), [])
+
+        db = _AuditDB(self.LAUNCHED[:-1])
+        alerts = self._run(db, _AuditSink([]), posted_at=time.time())
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("R$ 3.054  (nunca lancado)", alerts[0])
+        self.assertNotIn("APAGARAM", alerts[0])
+
+    def test_fresh_list_still_flags_a_row_deleted_from_the_sheet(self) -> None:
+        sheet = [(dte, f"{amt:.2f}".replace(".", ",")) for dte, amt in self.LAUNCHED[:-1]]
+        alerts = self._run(_AuditDB(self.LAUNCHED), _AuditSink(sheet), posted_at=time.time())
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("R$ 3.054  (foi lancado, mas APAGARAM da planilha)", alerts[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1802,6 +1802,10 @@ FECHAMENTO_TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 FECHAMENTO_TOTAL_RE = re.compile(r"^(?:R\$|RS)?\s*(\d{1,3}(?:\.\d{3})+|\d+),(\d{2})$", re.IGNORECASE)
 FECHAMENTO_MATCH_TOLERANCE = 1.0  # list values are whole reais; the sheet keeps cents
 FECHAMENTO_DATE_SLACK_DAYS = 3
+# The operator clears the sheet after each fechamento, so only a list audited
+# right after it was posted can be compared with it. Older lists (picked up
+# hours later when WeChat touches the file) would flag every row as deleted.
+FECHAMENTO_MAX_AGE_SECONDS = 30 * 60
 ALERTS_LOG_NAME = "ALERTAS_FECHAMENTO.txt"
 
 
@@ -1986,6 +1990,7 @@ def audit_fechamento(
     sink: "RowSink",
     ocr: "OCREngine",
     source_name: str,
+    posted_at: Optional[float] = None,
 ) -> None:
     """Compare a posted fechamento list with what reached the sheet. Never raises."""
     try:
@@ -1993,6 +1998,13 @@ def audit_fechamento(
             return
         meta_key = f"fechamento_audit:{digest}"
         if db.get_meta(meta_key) is not None:
+            return
+        if posted_at and time.time() - posted_at > FECHAMENTO_MAX_AGE_SECONDS:
+            db.set_meta(meta_key, "ANTIGA")
+            print(
+                f"[FECHAMENTO] {source_name} | cliente={client} | lista_antiga_ignorada"
+                f" | postada_ha={(time.time() - posted_at) / 60:.0f}min"
+            )
             return
         if text is None:
             if img is None:
@@ -2030,6 +2042,12 @@ def audit_fechamento(
                 never = find_missing_fechamento_rows(
                     parsed["rows"], db.list_client_receipts_since(client, time.time() - 15 * 86400), date_slack_days=1
                 )
+                if len(missing) == len(parsed["rows"]):
+                    # Not one row on the sheet: it was already cleared after the
+                    # fechamento, so "deleted" means nothing. Only real gaps count.
+                    print(f"[FECHAMENTO] {source_name} | cliente={client} | planilha_ja_limpa | nunca_lancados={len(never)}")
+                    missing = [r for r in missing if any(r is n for n in never)]
+        if missing:
             lines = [
                 f"  {r['date']} {r['time'] or '--:--'}  {r['bank'] or '-'}  R$ {r['amount']:,.0f}".replace(",", ".")
                 + ("  (nunca lancado)" if any(r is n for n in never) else "  (foi lancado, mas APAGARAM da planilha)")
@@ -7026,6 +7044,7 @@ def process_item(
                         sink=sink,
                         ocr=ocr,
                         source_name=path.name,
+                        posted_at=float(resolution.msg_ref.create_time or 0.0) or path.stat().st_mtime,
                     )
                 except Exception as exc:
                     print(f"[WARN] fechamento_audit_open_failed | {path.name} | err={type(exc).__name__}: {exc}")
