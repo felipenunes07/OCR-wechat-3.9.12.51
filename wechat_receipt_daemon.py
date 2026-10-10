@@ -1957,7 +1957,7 @@ def ocr_tall_image_in_strips(img: Image.Image, ocr: "OCREngine") -> str:
 
 
 def raise_operator_alert(title: str, message: str) -> None:
-    """Log, persist and pop up an alert the operator cannot miss."""
+    """Log and persist an alert. No pop-up: the operator asked for none (10/10/2026)."""
     print(f"[ALERTA] {title} | {message.replace(chr(10), ' / ')}")
     try:
         log_path = Path(__file__).resolve().parent / ALERTS_LOG_NAME
@@ -1965,19 +1965,6 @@ def raise_operator_alert(title: str, message: str) -> None:
             fh.write(f"[{datetime.now():%d/%m/%Y %H:%M:%S}] {title}\n{message}\n\n")
     except Exception as exc:
         print(f"[WARN] alert_log_failed | err={exc}")
-    if os.name != "nt" or os.environ.get("WECHAT_OCR_NO_POPUP"):
-        return
-
-    def _popup() -> None:
-        try:
-            import ctypes
-
-            # MB_ICONWARNING | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
-            ctypes.windll.user32.MessageBoxW(0, message, title, 0x30 | 0x1000 | 0x10000 | 0x40000)
-        except Exception as exc:
-            print(f"[WARN] alert_popup_failed | err={exc}")
-
-    threading.Thread(target=_popup, name="operator-alert", daemon=True).start()
 
 
 def audit_fechamento(
