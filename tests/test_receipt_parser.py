@@ -548,6 +548,98 @@ class ParseReceiptFieldsTests(unittest.TestCase):
 
         self.assertEqual(fields["amount"], 90000.0)
 
+    def test_ocr_misread_tarifa_never_beats_valor_line(self) -> None:
+        # Real OCR text 15/10/2026 (photographed Bradesco agendamento): "Tarifa"
+        # read as "Tanifa", so R$ 9,80 was launched instead of R$ 9.159,75.
+        text = "\n".join(
+            [
+                "Confirmacao de Agendamento",
+                "Transerir",
+                "Datadaoperaczo:20/08/2026-13h30",
+                "Empresa:R MONTEIRO COMDE PROD OPTICOS LTDA",
+                "NOme: DIAMOND SERVICES LTDA",
+                "Instituicao destino: BCoDO BRASILS.A,",
+                "Josdatransferenda",
+                "Tanifa:R$9,80",
+                "Valor:R$9.159,75",
+                "Midia: BRADESCO NETEMPRESA",
+                "DescTicao:FECHAMENTO",
+                "Debitado da:Conta-corrente",
+                "Data dedebito:15/10/2026",
+                "Instituicao origem: BANCO BRADESCO S.A.",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 9159.75)
+        # Scheduled transfer: the money moves on the debit date, not the
+        # operation (scheduling) date.
+        self.assertEqual(fields["txn_date"], "15/10/2026")
+        self.assertEqual(fields["txn_time"], "-")
+
+    def test_mensagem_field_label_does_not_hide_the_value(self) -> None:
+        # Real OCR text 15/10/2026 (Magalu Pay): "Mensagem" is a field label and
+        # was taken for the Mercado Pago banner, so the receipt had no value.
+        text = "\n".join(
+            [
+                "Magaupay",
+                "Comprovante de transacao Pix",
+                "15/10/2026as10h21min08s",
+                "Detalhes da transacao Pix",
+                "Valor",
+                "R$ 2.560,00",
+                "Mensagem",
+                "Quemrecebeu",
+                "Nome",
+                "CleendIntermediacaoEAtacadoLtda",
+            ]
+        )
+
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+
+        self.assertEqual(fields["amount"], 2560.0)
+
+    def test_bb_sisbb_print_is_a_single_receipt(self) -> None:
+        # Real OCR text 15/10/2026: the same date four times plus footer phone
+        # numbers tripped MULTI_TRANSACTION_LIST and the R$ 3.728 was dropped.
+        text = "\n".join(
+            [
+                "15/10/2026,11:37",
+                "SISBB",
+                "SISTEMA DE INFORMACOES BANCO DO BRASIL",
+                "15/10/2026-",
+                "AUTOATENDIMENTO",
+                "11.37.05",
+                "Comprovante Pix",
+                "CLIENTE:JMS IMOBILIARIA LTDA -ME",
+                "AGENCIA:1369-2CONTA:",
+                "31.428-5",
+                "ID:",
+                "E0000000020261015143543922313709",
+                "VALOR:",
+                "R$3.728,00",
+                "TARIFA:",
+                "R$10,00",
+                "DATA:",
+                "15/10/2026-11:36:45",
+                "PAGO PARA:",
+                "Cleend Eletronicos",
+                "Notificacaoenviadaem:15/10/2026-11:36:46",
+                "DOCUMENTO:101506",
+                "Central de Atendimento BB",
+                "40040001",
+                "SAC BB",
+                "08007290722",
+                "Ouvidoria",
+                "08007295678",
+                "08007290088",
+            ]
+        )
+
+        self.assertEqual(looks_like_single_receipt(text), (True, "OK"))
+        self.assertEqual(parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)["amount"], 3728.0)
+
     def test_parses_compact_alpha_month_datetime(self) -> None:
         text = "\n".join(
             [

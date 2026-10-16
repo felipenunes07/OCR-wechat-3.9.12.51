@@ -739,6 +739,9 @@ AMOUNT_FEE_LINE_HINTS = (
     "juros",
     "iof",
 )
+# OCR misreads of "Tarifa" on photographed Bradesco agendamentos ("Tanifa:R$9,80",
+# "Tarfa:R$ 9,80", 15/10/2026): the plain hint missed them and the fee beat "Valor: R$ 9.159,75".
+AMOUNT_FEE_LINE_FUZZY_PATTERN = re.compile(r"t[a@][rn][il1]?[ft]a")
 AMOUNT_NEGATIVE_HINTS = (
     "tarifa",
     "taxa",
@@ -782,6 +785,10 @@ def has_promo_marker(context_low: str) -> bool:
     if len(hits) >= 2:
         return True
     marker = next(iter(hits))
+    # "Mensagem" is also a regular Pix field label ("Valor R$ 2.560,00" /
+    # "Mensagem --" on Magalu Pay, 15/10/2026); alone it never means the banner.
+    if marker in AMOUNT_PROMO_FIELD_LABELS:
+        return False
     for m in re.finditer(re.escape(marker), context_low):
         before = context_low[m.start() - 1:m.start()]
         after = context_low[m.end():m.end() + 1]
@@ -799,6 +806,7 @@ AMOUNT_PROMO_MARKERS = (
     "faca um",
     "facaum",
 )
+AMOUNT_PROMO_FIELD_LABELS = frozenset({"mensagem"})
 MONTH_TOKEN_MAP = {
     "JAN": 1,
     "JANEIRO": 1,
@@ -1255,6 +1263,26 @@ def extract_datetime_values(text: str) -> tuple[Optional[str], Optional[str]]:
     return _pick_best_date_candidate(lines), _pick_best_time_candidate(lines)
 
 
+def extract_scheduled_debit_date(text: str) -> Optional[str]:
+    """Debit date of a scheduled transfer ("Confirmacao de Agendamento").
+
+    The slip leads with "Data da operacao" (the day it was scheduled, weeks
+    earlier) but the money only moves on "Data de debito" -- that is the date
+    the sheet needs (Bradesco agendamentos debited 15/10/2026 were filed under
+    20/08 and 21/09).
+    """
+    normalized = normalize_ocr_text_for_parsing(text)
+    compact_low = re.sub(r"\s+", "", normalized.lower())
+    if "agend" not in compact_low:
+        return None
+    for label in re.finditer(r"d[eo]b[il1]t[oa]", normalized, flags=re.IGNORECASE):
+        window = normalized[label.end():label.end() + 40]
+        found = _iter_date_candidates(window)
+        if found:
+            return found[0][0]
+    return None
+
+
 def extract_first_date_value(text: str) -> Optional[str]:
     txn_date, _txn_time = extract_datetime_values(text)
     return txn_date
@@ -1327,7 +1355,11 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
         return (False, "TABULAR_TRANSFER_LIST")
     if has_table_header and (date_count >= 3 or time_count >= 3):
         return (False, "TABULAR_TRANSFER_LIST")
-    if date_count >= 4 and amount_count >= 6:
+    # A BB SISBB print repeats the same date in its header, body and notification
+    # line, and the footer phone numbers count as amounts (15/10/2026, R$ 3.728).
+    # One Pix end-to-end id under a "Comprovante" title is a single receipt.
+    is_single_pix_slip = "comprovante" in compact_low and len(extract_pix_transaction_ids(text)) == 1
+    if date_count >= 4 and amount_count >= 6 and not is_single_pix_slip:
         return (False, "MULTI_TRANSACTION_LIST")
     if not has_strong_kw and date_count >= 2 and amount_count >= 4:
         return (False, "WEAK_RECEIPT_SIGNAL")
@@ -1589,7 +1621,7 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
                 score -= 14
             # An amount labeled on its own line as a fee ("Tarifa: R$ 0,00") is not
             # the transaction value, even when neighbouring lines carry strong hints.
-            if any(token in line_low for token in AMOUNT_FEE_LINE_HINTS):
+            if any(token in line_low for token in AMOUNT_FEE_LINE_HINTS) or AMOUNT_FEE_LINE_FUZZY_PATTERN.search(line_low):
                 score -= 30
             # On fee-bearing slips (TED/DOC with "TARIFA"), "TOTAL" is value+fee;
             # the transaction value is the explicitly labeled one ("VALOR DA TED").
@@ -2055,6 +2087,11 @@ def parse_receipt_fields(text: str, ocr_conf: float, q_score: float) -> dict[str
     raw = "\n".join(lines)
 
     parsed_txn_date, parsed_txn_time = extract_datetime_values(raw)
+    scheduled_debit_date = extract_scheduled_debit_date(raw)
+    if scheduled_debit_date:
+        if scheduled_debit_date != parsed_txn_date:
+            parsed_txn_time = None  # the printed time belongs to the scheduling day
+        parsed_txn_date = scheduled_debit_date
     txn_date_source = "parsed" if parsed_txn_date else "fallback_today"
     txn_time_source = "parsed" if parsed_txn_time else "fallback_dash"
     txn_date = parsed_txn_date or today_local_date_str()
