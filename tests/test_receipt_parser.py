@@ -2194,6 +2194,17 @@ class GluedZeroCentFixTests(unittest.TestCase):
         )
         self.assertTrue(payload["value_uncertain"])
 
+    def test_exact_amount_client_keeps_cents_on_sheet(self) -> None:
+        from wechat_receipt_daemon import build_sheet_payload_from_receipt
+
+        def sheet_value(client: str) -> float:
+            return build_sheet_payload_from_receipt(
+                {"file_id": "f1", "client": client, "amount": 61000.23, "amount_rounded": 61000.0}
+            )["amount"]
+
+        self.assertEqual(sheet_value("111"), 61000.23)
+        self.assertEqual(sheet_value("991"), 61000.0)
+
 
 class MaskedCpfNeverAmountTests(unittest.TestCase):
     """Masked payer documents must never be parsed as the transfer value.

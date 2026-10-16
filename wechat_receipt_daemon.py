@@ -142,6 +142,15 @@ VIDEO_RECEIPT_CLIENTS = {
     for label in os.getenv("WECHAT_VIDEO_RECEIPT_CLIENTS", "991").split(",")
     if label.strip()
 }
+# Clients whose group asked for the exact receipt value on the sheet, cents
+# included, instead of the usual whole-real rounding (111, 16/10/2026: "Quero
+# exatamente o valor ... 61000.23"). Comma-separated labels as in
+# clientes_grupos.json.
+EXACT_AMOUNT_CLIENTS = {
+    label.strip().upper()
+    for label in os.getenv("WECHAT_EXACT_AMOUNT_CLIENTS", "111").split(",")
+    if label.strip()
+}
 # The receipt is on screen at the START of these recordings: the client opens the
 # bank app on the receipt and then scrolls. Past the midpoint the value has
 # already left the frame, so sampling late frames only costs OCR time and
@@ -2187,6 +2196,12 @@ def should_stage_receipt(fields: dict[str, Any]) -> bool:
     return fields.get("amount") is not None
 
 
+def sheet_amount(client: Any, amount: Optional[float], amount_rounded: Optional[float]) -> Optional[float]:
+    if amount is not None and str(client or "").strip().upper() in EXACT_AMOUNT_CLIENTS:
+        return amount
+    return amount_rounded if amount_rounded is not None else amount
+
+
 def build_sheet_payload_from_receipt(
     receipt_payload: dict[str, Any],
     existing_payload: Optional[dict[str, Any]] = None,
@@ -2199,10 +2214,10 @@ def build_sheet_payload_from_receipt(
             "txn_date": receipt_payload.get("txn_date"),
             "txn_time": receipt_payload.get("txn_time"),
             "bank": receipt_payload.get("bank"),
-            "amount": (
-                receipt_payload.get("amount_rounded")
-                if receipt_payload.get("amount_rounded") is not None
-                else receipt_payload.get("amount")
+            "amount": sheet_amount(
+                receipt_payload.get("client"),
+                receipt_payload.get("amount"),
+                receipt_payload.get("amount_rounded"),
             ),
             "verification_status": receipt_payload.get("verification_status"),
             "msg_svr_id": receipt_payload.get("msg_svr_id"),
@@ -5168,7 +5183,7 @@ class StateDB:
                         "txn_date": row["txn_date"],
                         "txn_time": row["txn_time"],
                         "bank": row["bank"],
-                        "amount": row["amount_rounded"] if row["amount_rounded"] is not None else row["amount"],
+                        "amount": sheet_amount(row["client"], row["amount"], row["amount_rounded"]),
                         "verification_status": row["verification_status"],
                         "msg_svr_id": msg_svr_id,
                         "talker": talker,
