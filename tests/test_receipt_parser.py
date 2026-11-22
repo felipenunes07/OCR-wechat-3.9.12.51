@@ -2617,5 +2617,243 @@ class FechamentoAuditAlertTests(unittest.TestCase):
         self.assertIn("R$ 3.054  (foi lancado, mas APAGARAM da planilha)", alerts[0])
 
 
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture_spans(name: str):
+    from wechat_receipt_daemon import OCRSpan
+
+    raw = json.loads((FIXTURES / f"spans_{name}.json").read_text(encoding="utf-8"))
+    return [OCRSpan(*item) for item in raw]
+
+
+def _segment_amounts(name: str) -> list:
+    from wechat_receipt_daemon import split_receipt_segments
+
+    return [
+        parse_receipt_fields(seg, ocr_conf=0.9, q_score=0.9)["amount"]
+        for seg in split_receipt_segments(_fixture_spans(name))
+    ]
+
+
+class RealPhotoSplitTests(unittest.TestCase):
+    # OCR spans saved from real WeChat photos (22/11/2026 investigation).
+
+    def test_grid_with_centered_fifth_slip_yields_all_five(self) -> None:
+        # Client 199, 20/11/2026: 2x2 grid plus one slip centered below.
+        # The old column clustering launched only the R$ 120 slip.
+        self.assertEqual(_segment_amounts("d5f498bce4c3"), [2000.0, 2000.0, 670.0, 1950.0, 120.0])
+
+    def test_sideways_photos_are_split(self) -> None:
+        # Client 199, 13 and 17/11/2026: slips photographed rotated 90 degrees.
+        self.assertEqual(sorted(_segment_amounts("2be29cb5")), [200.0, 1900.0, 1900.0, 2000.0, 2000.0, 2000.0])
+        self.assertEqual(sorted(_segment_amounts("77ddef98")), [100.0, 100.0, 2540.0])
+
+    def test_phone_screen_title_bar_is_not_a_second_receipt(self) -> None:
+        # Client 991: "Comprovante de..." in the app bar above the real
+        # "Comprovante de Pix" split one receipt in two.
+        for name in ("2c85ca7a94fa", "2c90fbbd2e58", "b1d823747bcf", "a83b3ee58f22", "4456b3e1f9", "69baa3483c", "fb3bbc385e"):
+            self.assertEqual(_segment_amounts(name), [], name)
+
+    def test_unreadable_slip_still_comes_back_as_a_segment(self) -> None:
+        # Client 1, 11/11/2026: second slip's value did not OCR. It must reach
+        # the caller (which writes a blank row), not disappear.
+        self.assertEqual(_segment_amounts("bd3db55b"), [480.0, None])
+
+
+class MercadoPagoPhotoCentsTests(unittest.TestCase):
+    def test_photographed_screen_keeps_superscript_cents(self) -> None:
+        # Client 65, 20/11/2026: "R$ 276^68" photographed off a phone was
+        # launched as R$ 27.668; "mercado pago" sits far from the value.
+        text = "\n".join(
+            [
+                "17:35",
+                "contato",
+                "19/novembro/2026as9.37:44",
+                "R$27668",
+                "Origem e destino",
+                "FulanaDeTalSilva",
+                "Mercado Pago",
+                "CPF:***.000.000-*",
+                "AmdRepresentacoeseServicosLtda",
+                "BANCO DO BRASIL S.A.",
+            ]
+        )
+        fields = parse_receipt_fields(text, ocr_conf=0.99, q_score=0.95)
+        self.assertEqual(fields["amount"], 276.68)
+        self.assertEqual(fields["amount_rounded"], 277.0)
+
+
+class BlankRowTests(unittest.TestCase):
+    def test_blank_fields_reach_the_sheet_as_marked_empty_value(self) -> None:
+        from wechat_receipt_daemon import blank_receipt_fields, build_sheet_payload_from_receipt
+
+        fields = blank_receipt_fields(
+            {"amount": 480.0, "amount_rounded": 480.0, "amount_source": "currency", "txn_date": "11/11/2026"}
+        )
+        self.assertIsNone(fields["amount"])
+        self.assertEqual(fields["txn_date"], "11/11/2026")
+        row = build_sheet_payload_from_receipt({**fields, "client": "1", "source_kind": "msgattach_image_dat"})
+        self.assertTrue(row["blank_marker"])
+        self.assertTrue(row["value_uncertain"])
+        self.assertIsNone(row["amount"])
+
+    def test_spreadsheet_strips_and_pdfs_never_get_a_blank_row(self) -> None:
+        from wechat_receipt_daemon import should_write_blank_row
+
+        self.assertTrue(should_write_blank_row(Image.new("RGB", (735, 1600)), "msgattach_image_dat"))
+        self.assertFalse(should_write_blank_row(Image.new("RGB", (729, 77)), "msgattach_image_dat"))
+        self.assertFalse(should_write_blank_row(Image.new("RGB", (735, 1600)), "file_pdf"))
+
+
+class VideoOpeningOrderTests(unittest.TestCase):
+    def _receipt(self, file_id: str, client: str) -> dict:
+        payload = build_receipt_payload(
+            file_id=file_id,
+            ingested_at=1500.0,
+            msg_svr_id=f"m-{file_id}",
+            msg_create_time=100.0,
+            amount=50.0,
+            amount_rounded=50.0,
+        )
+        payload["client"] = client
+        payload["talker"] = f"talker-{client}"
+        return payload
+
+    def _run(self, client: str):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                # Video opened at t=1000, still waiting for its message.
+                insert_file_row(
+                    db, file_id="video", path="C:/fake/video.mp4", source_kind="video_receipt",
+                    status="retry", first_seen=1000.0, last_error="WAITING_VIDEO_MESSAGE",
+                )
+                # Print opened right after it, already read.
+                insert_file_row(
+                    db, file_id="print", path="C:/fake/print.dat", source_kind="msgattach_image_dat",
+                    status="done", first_seen=1001.0, last_error=None,
+                )
+                db.insert_receipt(self._receipt("print", client))
+                # 5 minutes later: far past the 90 s stall.
+                with patch("wechat_receipt_daemon.time.time", return_value=1300.0):
+                    return db.claim_next_sink_receipt(sheet_order_scope="global")
+            finally:
+                db.close()
+
+    def test_video_client_print_waits_for_earlier_video(self) -> None:
+        self.assertIsNone(self._run("991"))
+
+    def test_other_clients_are_not_held_by_a_video(self) -> None:
+        claimed = self._run("65")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["file_id"], "print")
+
+    def test_multi_receipt_slip_rows_follow_their_photo_opening_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db, file_id="photo", path="C:/fake/photo.dat", source_kind="msgattach_image_dat",
+                    status="done", first_seen=1000.0, last_error=None,
+                )
+                insert_file_row(
+                    db, file_id="later", path="C:/fake/later.dat", source_kind="msgattach_image_dat",
+                    status="done", first_seen=1001.0, last_error=None,
+                )
+                # The photo was opened first but its slips took longer to read
+                # than the single print opened after it.
+                slip = self._receipt("photo#p1", "199")
+                slip["ingested_at"] = 1050.0
+                later = self._receipt("later", "199")
+                later["ingested_at"] = 1010.0
+                db.insert_receipt(slip)
+                db.insert_receipt(later)
+                with patch("wechat_receipt_daemon.time.time", return_value=1060.0):
+                    claimed = db.claim_next_sink_receipt(sheet_order_scope="global")
+                self.assertEqual(claimed["file_id"], "photo#p1")
+                self.assertEqual(claimed["source_first_seen"], 1000.0)
+            finally:
+                db.close()
+
+
+
+class CrowdedDepositPhotoTests(unittest.TestCase):
+    def test_nine_slip_photo_never_launches_a_wrong_value(self) -> None:
+        # Client 199, 12/11/2026: 3x3 BB deposit slips, top row headers not
+        # OCR'd, values partly misread ("2.800", "1:108", "180"). Every slip is
+        # found; a value is only kept when the slip confirms it, else blank.
+        from wechat_receipt_daemon import (
+            CASH_DEPOSIT_UNREADABLE,
+            reconcile_cash_deposit_amount,
+            split_receipt_segments,
+        )
+
+        truth = [2000.0, 2000.0, 2000.0, 2000.0, 1100.0, 1900.0, 2000.0, 1900.0, 100.0]
+        segments = split_receipt_segments(_fixture_spans("8cd21197"))
+        self.assertEqual(len(segments), 9)
+        checked = [reconcile_cash_deposit_amount(seg) for seg in segments]
+        for got, real in zip(checked, truth):
+            if got != CASH_DEPOSIT_UNREADABLE:
+                self.assertEqual(got, real)
+        self.assertGreaterEqual(sum(1 for got in checked if got != CASH_DEPOSIT_UNREADABLE), 5)
+
+    def test_disagreeing_copies_settled_by_note_count(self) -> None:
+        from wechat_receipt_daemon import reconcile_cash_deposit_amount
+
+        text = "\n".join(
+            [
+                "COMPROVANTE DE DEPOSITO EM CONTA CORRENTE",
+                "VALOR DINHEIRO 1.908,80",
+                "VALOR TOTAL 1.900,00",
+                "QUANTIDADE DE CEDULAS PROCESSADAS 19",
+                "NR.AUTENTICACAO C.D37.F43.965.82F.705",
+            ]
+        )
+        self.assertEqual(reconcile_cash_deposit_amount(text), 1900.0)
+
+
+class ClientSendsTests(unittest.TestCase):
+    def test_daily_ledger_print_is_not_a_receipt(self) -> None:
+        # Client 17, 22/11/2026: the client's daily ledger crop was launched as
+        # R$ 2 off "R$ 2, 816, 331.84". It came in ~25 times since 09/2026.
+        text = "\n".join(
+            [
+                "DATA", "DAT DO", "HORARIO", "COHTA DO", "PIGADOR", "VALOR", "COHTEHTE",
+                "COIPROTAHTE", "SALDO", "REGISTRADA", "BAHCO", "2026/11/18",
+                "上次结余", "R$ 2, 816, 331.84", "16:07", "16:07", "小计（已收款)", "R$ 278, 920. 85",
+            ]
+        )
+        self.assertEqual(looks_like_single_receipt(text), (False, "DAILY_LEDGER"))
+
+    def test_pix_card_with_glued_currency(self) -> None:
+        # Client 17, 22/11/2026: "Voce fez um Pix de R$ 500" OCR'd glued.
+        text = "VocéfezumPixdeRs500\nAmdRepresentacoeseServicosLtda\nBcodoBrasilS.A."
+        self.assertEqual(parse_receipt_fields(text, ocr_conf=0.9, q_score=0.9)["amount"], 500.0)
+
+    def test_note_denomination_is_not_glued_currency(self) -> None:
+
+        text = "001NOTA(S)DERS 20,00\nVALOR DO DEPOSITO:RS1.900,00\nComprovante de deposito"
+        self.assertEqual(parse_receipt_fields(text, ocr_conf=0.9, q_score=0.9)["amount"], 1900.0)
+
+    def test_sentence_punctuation_after_cents(self) -> None:
+        self.assertEqual(normalize_amount("200,00."), 200.0)
+        self.assertEqual(normalize_amount("6287.93,"), 6287.93)
+        self.assertEqual(normalize_amount("1.000"), 1000.0)
+
+    def test_sisbb_fee_cap_footer_is_not_the_value(self) -> None:
+        # Client 17, 15/09/2026: launched R$ 1.000 for a R$ 3.085,60 Pix.
+        text = "\n".join(
+            [
+                "SISBB", "Comprovante Pix", "VALOR:", "TARIFA:", "R$3.085,60", "DATA:", "R$0,00",
+                "15/09/2026-12:05:25", "PAGO PARA:", "Amd Representacoes e Servicos Ltda",
+                "Esta transag5o pode ser tarifada em ate0.99%.",
+                "com valor maximo de Rs10,00. 0 valor definitivo",
+            ]
+        )
+        self.assertEqual(parse_receipt_fields(text, ocr_conf=0.9, q_score=0.9)["amount"], 3085.6)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,13 @@ MANUAL_SESSION_ID_META_KEY = "manual_session_id"
 # image opened before it is still unread; a candidate stalled longer than this stops
 # blocking so one broken file cannot freeze the whole sheet.
 OPEN_ORDER_STALL_SECONDS = 90
+# How long a video still waiting for its WeChat message holds back the rows of
+# video clients opened after it (see claim_next_sink_receipt). Past this the
+# video is either resolved or dropped (PDF_ORPHAN_GRACE_SECONDS after the index
+# catches up), so the sheet never freezes for good.
+VIDEO_ORDER_STALL_SECONDS = 900
+# SQL expression: the files.file_id behind a receipt id ("<id>#p2" -> "<id>").
+RECEIPT_BASE_FILE_ID_SQL = "CASE WHEN instr({col}, '#') > 0 THEN substr({col}, 1, instr({col}, '#') - 1) ELSE {col} END"
 REALTIME_SOURCE_EVENTS = {"created", "modified", "ui-force"}
 MANUAL_OPEN_SOURCE_KINDS = {"msgattach_image_dat", "msgattach_image_plain", "temp_image"}
 MANUAL_OPEN_ONLY_IGNORE_REASON = "IGNORED_MANUAL_OPEN_ONLY"
@@ -724,7 +731,10 @@ ALPHA_MONTH_DATE_PATTERN = re.compile(
 )
 TIME_PATTERN = re.compile(r"(?<!\d)(\d{1,2}\s*(?::|h)\s*\d{2}(?:\s*(?::|h)\s*\d{2})?)(?!\d)", re.IGNORECASE)
 AMOUNT_CURRENCY_PATTERN = re.compile(
-    r"(?<![A-Z0-9])(R\$|RS|US\$|USD|BRL|CNY|RMB|¥|￥|R(?=\s))\s*([0-9][0-9\.,]{0,20})",
+    # "Pix de"/"valor de" may touch the currency: OCR glues "Pix de R$ 500"
+    # into "PixdeRs500" (client 17, 22/11/2026, launched nothing). Only those
+    # two: "NOTA(S) DE R$ 20,00" on cash-deposit slips is a note denomination.
+    r"(?:(?<![A-Z0-9])|(?<=pixde)|(?<=valorde))(R\$|RS|US\$|USD|BRL|CNY|RMB|¥|￥|R(?=\s))\s*([0-9][0-9\.,]{0,20})",
     re.IGNORECASE,
 )
 AMOUNT_FALLBACK_PATTERN = re.compile(
@@ -747,6 +757,10 @@ AMOUNT_FEE_LINE_HINTS = (
     "taxa",
     "juros",
     "iof",
+    # BB SISBB footer "tarifada em ate 0,99% com valor maximo de R$ 10,00":
+    # it beat "VALOR: R$ 3.085,60" and launched R$ 1.000 (client 17, 09-10/2026).
+    "maximo",
+    "máximo",
 )
 # OCR misreads of "Tarifa" on photographed Bradesco agendamentos ("Tanifa:R$9,80",
 # "Tarfa:R$ 9,80", 15/10/2026): the plain hint missed them and the fee beat "Valor: R$ 9.159,75".
@@ -1353,6 +1367,13 @@ def looks_like_single_receipt(text: str) -> tuple[bool, str]:
 
     if has_balance_summary:
         return (False, "BALANCE_SUMMARY")
+    # The client's daily ledger (DATA REGISTRADA / PAGADOR / SALDO with
+    # "上次结余" previous balance and "小计/今日汇总" totals). A cropped print
+    # of it was launched as a R$ 2 receipt off "R$ 2, 816, 331.84" (client 17,
+    # 22/11/2026); the client sends it every day.
+    ledger_markers = ("上次结", "今日汇总", "小计", "已收款", "dataregistrada")
+    if any(marker in compact_low for marker in ledger_markers):
+        return (False, "DAILY_LEDGER")
     # A single TED/DOC slip legitimately contains data/hora/banco/transfer plus
     # "TOTAL" (value + fee). An explicit single-receipt title trumps the tabular
     # heuristic; genuine multi-transfer lists are still caught by the
@@ -1431,7 +1452,16 @@ def _receipt_anchor_norm(text: str) -> str:
     return re.sub(r"[^a-z]", "", strip_accents(str(text or "").lower()))
 
 
+# Slip header: "comprovante de", a bare "comprovante" (confirmed later by its
+# "DE ..." neighbour), or one with a misread letter ("comprdvante de").
+SLIP_HEADER_PATTERN = re.compile(r"comprovantede|^comprovante$|c[a-z]mpr[a-z]v[a-z]nte(?:de|$)")
+
+
 def split_receipt_segments(spans: list["OCRSpan"]) -> list[str]:
+    return [text for text, _region in split_receipt_regions(spans)]
+
+
+def split_receipt_regions(spans: list["OCRSpan"]) -> list[tuple[str, list[int]]]:
     """Split one photo containing SEVERAL receipts into per-receipt texts.
 
     Clients photograph 2-6 printed slips side by side; reading the OCR output
@@ -1442,61 +1472,161 @@ def split_receipt_segments(spans: list["OCRSpan"]) -> list[str]:
     """
     if not spans:
         return []
-    anchors = [s for s in spans if "comprovantede" in _receipt_anchor_norm(s.text)]
-    if len(anchors) < 2:
+    # OCR sometimes cuts the header in two ("COMPROVANTE" + "DE DEPOSITO ..."),
+    # so a bare "COMPROVANTE" also counts; it is confirmed below by its "DE ..."
+    # neighbour on the same line.
+    # "COMPRDVANTE DE ..." (a misread letter) still counts.
+    anchors = [s for s in spans if SLIP_HEADER_PATTERN.search(_receipt_anchor_norm(s.text))]
+    # "EM DINHEIRO" (second line of a BB deposit header) can stand in for a
+    # header the OCR missed, so it may supply the second anchor below.
+    if not anchors or (len(anchors) < 2 and not any("emdinheiro" in _receipt_anchor_norm(s.text) for s in spans)):
         return []
+
+    # Slips photographed sideways: the OCR reads the rotated lines, but their
+    # boxes are tall and narrow and the slip's lines stack along x. Rotate the
+    # boxes into reading order first (client 199 sends these, 13 and 17/11/2026).
+    vertical = sum(1 for a in anchors if (a.bottom - a.top) > 2.0 * (a.right - a.left))
+    if vertical * 2 > len(anchors):
+        labels = [
+            s for s in spans
+            if any(tok in _receipt_anchor_norm(s.text) for tok in ("valor", "data", "cliente", "agencia", "creditado"))
+        ]
+
+        def _nearest_anchor_x(s: "OCRSpan") -> float:
+            return min(anchors, key=lambda a: (a.x - s.x) ** 2 + (a.y - s.y) ** 2).x
+
+        leftwards = sum(1 for s in labels if s.x < _nearest_anchor_x(s)) >= sum(
+            1 for s in labels if s.x > _nearest_anchor_x(s)
+        )
+        if leftwards:  # text runs downwards, lines advance to the left
+            rotated = [OCRSpan(s.top, -s.right, s.bottom, -s.left, s.text, s.conf) for s in spans]
+        else:  # text runs upwards, lines advance to the right
+            rotated = [OCRSpan(-s.bottom, s.left, -s.top, s.right, s.text, s.conf) for s in spans]
+        return split_receipt_regions(rotated)
 
     heights = sorted((s.bottom - s.top) for s in spans if s.bottom > s.top)
     line_h = heights[len(heights) // 2] if heights else 12.0
-    total_left = min(s.left for s in spans)
-    total_right = max(s.right for s in spans)
-    total_width = max(1.0, total_right - total_left)
+    # The date/bank line sits a couple of lines ABOVE the header.
+    lead = 3.0 * line_h
 
-    # Columns: cluster anchor x-centers; a gap larger than a third of the image
-    # width means a new column of slips.
-    columns: list[list["OCRSpan"]] = []
-    for anchor in sorted(anchors, key=lambda s: s.x):
-        if columns and (anchor.x - columns[-1][-1].x) <= 0.33 * total_width:
-            columns[-1].append(anchor)
-        else:
-            columns.append([anchor])
+    def _same_line(a: "OCRSpan", s: "OCRSpan", left: float, right: float) -> bool:
+        return (
+            abs(s.y - a.y) <= 0.6 * line_h
+            and s.left <= right + 1.2 * line_h
+            and s.right >= left - 1.2 * line_h
+        )
 
-    col_centers = [sum(a.x for a in col) / len(col) for col in columns]
+    # Widen each header to its whole printed line: a header the OCR cut short
+    # ("COMPROVANTE DE" | "DEPOSITO EM CONTA CORRENTE") otherwise owns only the
+    # left third of its slip and loses the value column.
+    widened: list["OCRSpan"] = []
+    for a in anchors:
+        left, right = a.left, a.right
+        grew = True
+        while grew:
+            grew = False
+            for s in spans:
+                if (s.left < left or s.right > right) and _same_line(a, s, left, right):
+                    left, right = min(left, s.left), max(right, s.right)
+                    grew = True
+        if re.fullmatch(r"c[a-z]mpr[a-z]v[a-z]nte", _receipt_anchor_norm(a.text)) and not any(
+            s is not a and _same_line(a, s, a.left, a.right) and _receipt_anchor_norm(s.text).startswith("de")
+            for s in spans
+        ):
+            continue
+        widened.append(OCRSpan(left, a.top, right, a.bottom, a.text, a.conf))
+    anchors = widened
+    if not anchors:
+        return []
 
-    def _column_of(span: "OCRSpan") -> int:
-        return min(range(len(col_centers)), key=lambda i: abs(span.x - col_centers[i]))
-
-    spans_by_column: dict[int, list["OCRSpan"]] = {}
+    # Headers the OCR skipped entirely: on a 3x3 photo of BB deposit slips
+    # the top row's "COMPROVANTE DE DEPOSITO" lines were never read, only
+    # their "EM DINHEIRO" line, and 4 of 9 deposits vanished (client 199,
+    # 12/11/2026). An "EM DINHEIRO" with no header just above it becomes a
+    # header of the usual slip width.
+    widths = sorted(a.right - a.left for a in anchors)
+    slip_w = widths[len(widths) // 2]
     for s in spans:
-        spans_by_column.setdefault(_column_of(s), []).append(s)
+        if "emdinheiro" not in _receipt_anchor_norm(s.text):
+            continue
+        has_header = any(
+            0 < s.y - a.y <= 2.5 * line_h and a.left - 0.2 * slip_w <= s.x <= a.right + 0.2 * slip_w
+            for a in anchors
+        )
+        if not has_header:
+            anchors.append(OCRSpan(s.x - slip_w / 2, s.top, s.x + slip_w / 2, s.bottom, s.text, s.conf))
+    if len(anchors) < 2:
+        return []
 
-    segments: list[str] = []
-    for col_idx, col_anchors in enumerate(columns):
-        col_spans = spans_by_column.get(col_idx, [])
-        ordered_anchors = sorted(col_anchors, key=lambda s: s.y)
-        for idx, anchor in enumerate(ordered_anchors):
-            # The date/bank line sits a couple of lines ABOVE the header.
-            start_y = anchor.y - 3.0 * line_h
-            end_y = ordered_anchors[idx + 1].y - 3.0 * line_h if idx + 1 < len(ordered_anchors) else float("inf")
-            region = [s for s in col_spans if start_y <= s.y < end_y]
-            if len(region) < 4:
-                continue
-            # Rebuild reading order: bucket spans into visual rows, join by x.
-            bucket = max(1.0, 0.8 * line_h)
-            rows: dict[int, list["OCRSpan"]] = {}
-            for s in region:
-                rows.setdefault(int(round(s.y / bucket)), []).append(s)
-            lines = []
-            for row_key in sorted(rows):
-                lines.append(" ".join(s.text for s in sorted(rows[row_key], key=lambda s: s.left) if s.text.strip()))
-            segment = "\n".join(line for line in lines if line.strip())
-            if segment.strip():
-                segments.append(segment)
-    return segments
+    # Each header owns a box: its own x-range (headers span the slip width)
+    # from just above it downwards. A span goes to the LOWEST header box that
+    # contains it, so a slip laid over the bottom of another one takes its own
+    # lines. Clustering headers into columns broke on a 2x2 grid with a fifth
+    # slip centered below: all five fell into one "column" and only 1 of the 5
+    # deposits was launched (client 199, 20/11/2026).
+    def _box(anchor: "OCRSpan") -> tuple[float, float, float]:
+        pad = 0.15 * max(1.0, anchor.right - anchor.left)
+        return (anchor.left - pad, anchor.right + pad, anchor.y - lead)
+
+    boxes = [_box(a) for a in anchors]
+    # Regions hold indexes into `spans`, so a caller can crop each slip from
+    # the image (rotation above keeps the order of the list).
+    regions: list[list[int]] = [[] for _ in anchors]
+    for span_idx, s in enumerate(spans):
+        owners = [i for i, (x0, x1, y0) in enumerate(boxes) if x0 <= s.x <= x1 and s.y >= y0]
+        if not owners:
+            continue
+        best = max(owners, key=lambda i: (boxes[i][2], -abs(s.x - anchors[i].x)))
+        regions[best].append(span_idx)
+
+    def _text(region: list[int]) -> str:
+        # Rebuild reading order: bucket spans into visual rows, join by x.
+        bucket = max(1.0, 0.8 * line_h)
+        rows: dict[int, list["OCRSpan"]] = {}
+        for span_idx in region:
+            s = spans[span_idx]
+            rows.setdefault(int(round(s.y / bucket)), []).append(s)
+        lines = []
+        for row_key in sorted(rows):
+            lines.append(" ".join(s.text for s in sorted(rows[row_key], key=lambda s: s.left) if s.text.strip()))
+        return "\n".join(line for line in lines if line.strip())
+
+    # A header with no value of its own (and, for an unreadable one, no
+    # "VALOR" label plus a printed date) is not a slip: the title bar of a phone screen
+    # ("Comprovante de..." above "Comprovante de Pix"), or the second header
+    # of one receipt (S4 Pag "Comprovante de liquidacao" under the
+    # transaction). Its lines belong to the header right below it, if any.
+    order = sorted(range(len(anchors)), key=lambda i: anchors[i].y)
+    kept: list[int] = []
+    for pos, i in enumerate(order):
+        region_text = _text(regions[i])
+        fields = parse_receipt_fields(region_text, ocr_conf=1.0, q_score=1.0)
+        if fields.get("amount") is not None or (
+            "valor" in _receipt_anchor_norm(region_text) and fields.get("txn_date_source") == "parsed"
+        ):
+            kept.append(i)
+            continue
+        x0, x1, _ = boxes[i]
+        below = [j for j in order[pos + 1:] if boxes[j][0] <= anchors[i].x <= boxes[j][1]]
+        if below:
+            regions[below[0]].extend(regions[i])
+    if len(kept) < 2:
+        return []
+    segments: list[tuple[str, list[int]]] = []
+    # Reading order: slips on the same printed row left to right.
+    for i in sorted(kept, key=lambda i: (round(anchors[i].y / (5.0 * line_h)), anchors[i].x)):
+        if len(regions[i]) < 4:
+            continue
+        segments.append((_text(regions[i]), regions[i]))
+    return segments if len(segments) >= 2 else []
 
 
 def normalize_amount(value: str) -> Optional[float]:
     s = re.sub(r"[^\d,\.]", "", value.strip())
+    # Sentence punctuation after complete cents is not a separator:
+    # "valor de R$200,00." and "Pix de R$6287.93," end a sentence.
+    if re.fullmatch(r"[\d,\.]*[\.,]\d{2}[\.,]", s):
+        s = s[:-1]
     if not s:
         return None
 
@@ -1567,12 +1697,21 @@ def round_amount_for_output(value: Optional[float]) -> Optional[float]:
     return float(integer)
 
 
-def should_apply_compact_cent_fix(raw_value: str, currency: Optional[str], context_low: str) -> bool:
+def should_apply_compact_cent_fix(
+    raw_value: str, currency: Optional[str], context_low: str, is_mercado_pago: bool = False
+) -> bool:
     digits = re.sub(r"\D", "", raw_value or "")
     if not digits or "." in raw_value or "," in raw_value:
         return False
     if currency != "BRL":
         return False
+    # Mercado Pago always keeps the thousands dot ("R$ 1.741"), so a glued
+    # 4-5 digit token there is superscript cents, wherever the "mercado pago"
+    # words sit. A photo of the phone screen puts them far from the value, and
+    # "R$27668" was launched as R$ 27.668 instead of R$ 276,68 (client 65,
+    # 20/11/2026).
+    if is_mercado_pago and 4 <= len(digits) <= 5:
+        return True
     # Tokens ending in "00" are NOT exempt: every layout except Mercado Pago
     # prints cents (~99% of 17k historical receipts), so "R$70000" is "R$ 700,00"
     # with the comma dropped, not a round R$ 70.000. Seven digits covers a fully
@@ -1684,7 +1823,7 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             used_compact_fix = False
             value = normalize_amount(raw_value)
             source = "currency"
-            if should_apply_compact_cent_fix(raw_value, currency, context_low):
+            if should_apply_compact_cent_fix(raw_value, currency, context_low, is_mercado_pago):
                 # Cents are always TWO digits on Brazilian receipts. Mercado Pago
                 # prints them as small superscript digits that OCR glues onto the
                 # value ("R$ 67,37" -> "6737", "R$ 37,20" -> "3720"), so a glued
@@ -1706,6 +1845,15 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             if after_char == "/":
                 continue  # document number (CNPJ/CPF like 18.236.120/0001-58), not an amount
             followed_by_letter = after_char.isalpha()
+            if (
+                followed_by_letter
+                and re.search(r"[.,]\d{1,2}$", raw_value)
+                and re.match(r"[A-Za-z][\d\.,]", line[m.end(2):m.end(2) + 2])
+            ):
+                # A letter INSIDE a thousands group ("R$21.39D,00" = 21.390,00
+                # with a misread 0) cuts it short; the prefix is never the value.
+                # "R$ 730,C0" or "RS392Q0" keep their integer part, so they stay.
+                continue
             if has_promo_marker(context_low):
                 continue  # promo/assistant banner amount (e.g. "R$ 50 para Ana") -> ignore
             candidates.append((score_candidate(raw_value, currency, "currency", used_compact_fix, followed_by_letter, candidate_value=value), idx, order, value, currency, raw_value, source, used_compact_fix))
@@ -1732,6 +1880,11 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
             after_char = line[m.end(1):m.end(1) + 1]
             if before_char == "/" or after_char == "/":
                 continue  # part of a date ("24/07/2026,18") or document number, not an amount
+            word_start = max(line.rfind(" ", 0, m.start(1)) + 1, 0)
+            word_end = line.find(" ", m.end(1))
+            word = line[word_start:word_end if word_end >= 0 else len(line)]
+            if re.fullmatch(r"[0-9A-Fa-f]{1,3}(?:\.[0-9A-Fa-f]{3}){3,}", word) and re.search(r"[A-Fa-f]", word):
+                continue  # BB authentication code "4.12C.3E6.FA8.BC6.142", not an amount
             if after_char == ":":
                 continue  # year glued to an hour ("2026,18:10:54") is date/time noise
             if before_char == "*" or after_char == "*":
@@ -2191,6 +2344,75 @@ def compute_review_needed(
     )
 
 
+BLANK_MARKER_SOURCE = "blank_marker"
+
+
+def blank_receipt_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Fields for a receipt we know arrived but could not read.
+
+    It still reaches the sheet, with the value cell empty and the row tinted
+    red, so the operator sees the gap in the opening sequence instead of a
+    receipt silently missing (request of 22/11/2026).
+    """
+    blank = dict(fields)
+    blank.update(
+        {
+            "amount": None,
+            "amount_raw": None,
+            "amount_rounded": None,
+            "amount_source": BLANK_MARKER_SOURCE,
+        }
+    )
+    return blank
+
+
+# Authentication codes ("3.48C.4A5", "AE7.41B") touch letters; money does not.
+_SLIP_MONEY_PATTERN = re.compile(r"(?<![\w\.,:])\d{1,3}(?:[\.,:]\d{3})*[\.,:]\d{2}(?![\w]|[\.,:]\d)")
+_SLIP_NOTE_COUNT_PATTERN = re.compile(r"processadas\s*(\d{1,3})(?![\d\.,:])")
+CASH_DEPOSIT_UNREADABLE = "UNREADABLE"
+
+
+def reconcile_cash_deposit_amount(text: str) -> Optional[float | str]:
+    """Cross-check a BB cash deposit slip read from a crowded photo.
+
+    The slip prints its value twice (VALOR DINHEIRO, VALOR TOTAL) plus the
+    number of notes. On a 3x3 photo the OCR read "2.800", "1.108" and "180"
+    for slips of 2.000, 1.100 and 100 (client 199, 12/11/2026). Returns the
+    value the readings agree on (one readable copy is taken as is), or the
+    one matching notes x a banknote when they disagree, or
+    CASH_DEPOSIT_UNREADABLE when nothing settles the conflict. None when the
+    text is not a cash deposit slip or shows no value at all.
+    """
+    norm = _receipt_anchor_norm(text)
+    # OCR mangles the labels ("DINHETRO", "OTNEIRO"), so any one of them will do.
+    if "valor" not in norm or not any(tok in norm for tok in ("dinheiro", "cedulas", "deposito")):
+        return None
+    values = []
+    for token in _SLIP_MONEY_PATTERN.findall(text):
+        value = normalize_amount(token.replace(":", "."))
+        if value is not None and value > 0:
+            values.append(value)
+    distinct = sorted(set(values))
+    if not distinct:
+        return None
+    if len(distinct) == 1:
+        return distinct[0]
+    count_match = _SLIP_NOTE_COUNT_PATTERN.search(strip_accents(text.lower()))
+    if count_match:
+        notes = int(count_match.group(1))
+        fitting = [v for v in distinct if any(abs(v - notes * bill) < 0.01 for bill in (100, 50, 200, 20))]
+        if len(fitting) == 1:
+            return fitting[0]
+    return CASH_DEPOSIT_UNREADABLE
+
+
+def should_write_blank_row(img: Image.Image, source_kind: str) -> bool:
+    if source_kind == "file_pdf":
+        return False
+    width, height = img.size
+    return height > 0 and width / height < 3.0
+
+
 def should_stage_receipt(fields: dict[str, Any]) -> bool:
     """A parse with no readable amount must never be staged for the sheet."""
     return fields.get("amount") is not None
@@ -2220,6 +2442,9 @@ def build_sheet_payload_from_receipt(
                 receipt_payload.get("amount_rounded"),
             ),
             "verification_status": receipt_payload.get("verification_status"),
+            # A row with an empty value is only ever written on purpose: the
+            # sink's no-amount guard lets through exactly these.
+            "blank_marker": receipt_payload.get("amount_source") == BLANK_MARKER_SOURCE,
             "msg_svr_id": receipt_payload.get("msg_svr_id"),
             "talker": receipt_payload.get("talker"),
             # Narrow "guessed value" signal: the value was either unreadable, or it
@@ -5037,7 +5262,9 @@ class StateDB:
                        f.mtime AS source_mtime
                 FROM receipts AS r
                 LEFT JOIN files AS f
-                  ON f.file_id = r.file_id
+                  -- "<file_id>#p2": one slip of a multi-receipt photo shares
+                  -- the photo's file (and so its opening time).
+                  ON f.file_id = {RECEIPT_BASE_FILE_ID_SQL.format(col="r.file_id")}
                 WHERE r.sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY')
                   AND COALESCE(r.sheet_next_attempt, 0) <= ?
                 ORDER BY
@@ -5056,7 +5283,8 @@ class StateDB:
                     -- that sequence ("ordem de abertura"), not OCR-completion order.
                     COALESCE(f.mtime, r.ingested_at) ASC,
                     {order_by},
-                    r.ingested_at ASC
+                    r.ingested_at ASC,
+                    r.file_id ASC
                 """,
                 (
                     float(now),
@@ -5071,6 +5299,7 @@ class StateDB:
 
             for row in rows:
                 file_id = str(row["file_id"])
+                base_file_id = file_id.split("#", 1)[0]
                 msg_svr_id = str(row["msg_svr_id"] or "").strip() or None
                 talker = str(row["talker"] or "").strip() or None
                 msg_create_time = float(row["msg_create_time"] or 0.0)
@@ -5089,6 +5318,17 @@ class StateDB:
                     # print (download, then a few frames to OCR), so leaving it out
                     # let a video opened later commit ahead of one opened first --
                     # 12/08/2026, rows 501/504/505 landed out of opening order.
+                    # A video waiting for its message keeps blocking far longer
+                    # than the 90 s stall: its client is only known once the
+                    # merged index catches up (4-10 min), and releasing the
+                    # prints opened after it put 7 of 991's videos below the
+                    # prints opened later (21/11/2026, rows 318-327). Only rows
+                    # of clients that send videos wait that long.
+                    video_wait_floor = (
+                        float(now - VIDEO_ORDER_STALL_SECONDS)
+                        if str(row["client"] or "").strip().upper() in VIDEO_RECEIPT_CLIENTS
+                        else float("inf")
+                    )
                     prior_open = cur.execute(
                         """
                         SELECT file_id
@@ -5097,11 +5337,19 @@ class StateDB:
                           AND file_id <> ?
                           AND status IN ('pending', 'retry', 'processing')
                           AND mtime < ?
-                          AND (status = 'processing' OR COALESCE(first_seen, 0) >= ?)
+                          AND (
+                                status = 'processing'
+                             OR COALESCE(first_seen, 0) >= ?
+                             OR (
+                                    source_kind = 'video_receipt'
+                                AND COALESCE(last_error, '') = 'WAITING_VIDEO_MESSAGE'
+                                AND COALESCE(first_seen, 0) >= ?
+                                )
+                          )
                         ORDER BY mtime ASC
                         LIMIT 1
                         """,
-                        (file_id, source_mtime, float(now - OPEN_ORDER_STALL_SECONDS)),
+                        (base_file_id, source_mtime, float(now - OPEN_ORDER_STALL_SECONDS), video_wait_floor),
                     ).fetchone()
                     if prior_open is not None:
                         blocker_note = f"WAITING_PRIOR_OPEN_FILE:{str(prior_open['file_id'])}"
@@ -5112,14 +5360,14 @@ class StateDB:
                             """
                             SELECT r2.file_id
                             FROM receipts AS r2
-                            JOIN files AS f2 ON f2.file_id = r2.file_id
+                            JOIN files AS f2 ON f2.file_id = {base}
                             WHERE r2.sheet_status IN ('SINK_PENDING', 'SINK_BLOCKED_PRIOR_MSG', 'SINK_RETRY', 'SINK_RUNNING')
                               AND r2.file_id <> ?
                               AND COALESCE(f2.mtime, 0) > 0
                               AND f2.mtime < ?
                             ORDER BY f2.mtime ASC
                             LIMIT 1
-                            """,
+                            """.format(base=RECEIPT_BASE_FILE_ID_SQL.format(col="r2.file_id")),
                             (file_id, source_mtime),
                         ).fetchone()
                         if prior_receipt is not None:
@@ -7302,22 +7550,31 @@ def process_item(
                 ingested_at = time.time()
                 for seg_idx, seg_text in enumerate(segments, 1):
                     seg_ok, _seg_reason = looks_like_single_receipt(seg_text)
-                    if not seg_ok:
-                        continue
                     seg_fields = parse_receipt_fields(seg_text, ocr_conf=ocr_conf, q_score=q_score)
                     seg_bank = seg_fields.get("bank")
                     if seg_bank is None:
                         seg_bank = detect_bank(f"{seg_text}\n{client}", seg_fields.get("beneficiary"))
                         seg_fields["bank"] = seg_bank
-                    # Stricter than the single path: a real slip has its own value
-                    # AND its own date; anything less is noise from the split (or
-                    # a long single receipt wrongly divided).
-                    if (
-                        seg_fields.get("amount") is None
+                    # The splitter only returns slips with their own header and a
+                    # value or date, so a slip that still fails here is a real
+                    # deposit the OCR could not read. It goes to the sheet as a
+                    # blank-value row instead of vanishing: the operator asked to
+                    # SEE where something was skipped (22/11/2026).
+                    # Crowded photos are low resolution: a cash deposit slip's
+                    # value is only trusted when its printed copies agree.
+                    slip_check = reconcile_cash_deposit_amount(seg_text)
+                    if isinstance(slip_check, float) and seg_fields.get("amount") != slip_check:
+                        seg_fields["amount"] = slip_check
+                        seg_fields["amount_rounded"] = round_amount_for_output(slip_check)
+                    seg_blank = (
+                        slip_check == CASH_DEPOSIT_UNREADABLE
+                        or not seg_ok
+                        or seg_fields.get("amount") is None
                         or seg_fields.get("txn_date_source") != "parsed"
                         or not has_core_signal(seg_fields, seg_bank)
-                    ):
-                        continue
+                    )
+                    if seg_blank:
+                        seg_fields = blank_receipt_fields(seg_fields)
                     seg_review = compute_review_needed(
                         fields=seg_fields,
                         bank=seg_bank,
@@ -7500,23 +7757,30 @@ def process_item(
                 print(f"[SKIP] {path.name} | continuacao_do_comprovante_anterior ({continuation_of})")
                 return
 
-        if not should_stage_receipt(fields):
-            # No readable amount and no continuation match: surface it as a
-            # visible exception -- a row with an empty value must never reach
-            # the client sheet (regression: 116A strip and 991 BB bottom half
-            # were committed with amount=None on 29/07/2026).
-            db.mark_exception(item.file_id, reason="EXCEPTION_NO_AMOUNT")
-            db.set_meta("last_exception_reason", "EXCEPTION_NO_AMOUNT")
-            db.mark_message_job_exception(msg_svr_id, note="EXCEPTION_NO_AMOUNT")
-            print(f"[EXCEPTION] {path.name} | sem_valor_nunca_lancar | verification={resolution.verification_status}")
+        blank_reason: Optional[str] = None
+        for failed, reason, label in (
+            (not should_stage_receipt(fields), "EXCEPTION_NO_AMOUNT", "sem_valor"),
+            (not has_core_signal(fields, bank), "EXCEPTION_MISSING_CORE_FIELDS", "missing_core_fields"),
+        ):
+            if not failed:
+                continue
+            # Continuation prints were already dropped above, so this is a
+            # receipt we could not read. On a client's own photo/print it goes
+            # to the sheet as a blank, red row so the gap is visible (request
+            # of 22/11/2026: BB incident slip, Remitly and "Pix de R$ 500"
+            # cards had vanished). PDFs (invoices) and wide strips (the team's
+            # own spreadsheet crops) keep the old exception, never a row.
+            if client and should_write_blank_row(img, resolution.resolved_source_kind):
+                blank_reason = reason
+                print(f"[BLANK] {path.name} | {label} | linha_em_branco_na_planilha | cliente={client}")
+                break
+            db.mark_exception(item.file_id, reason=reason)
+            db.set_meta("last_exception_reason", reason)
+            db.mark_message_job_exception(msg_svr_id, note=reason)
+            print(f"[EXCEPTION] {path.name} | {label} | verification={resolution.verification_status}")
             return
-
-        if not has_core_signal(fields, bank):
-            db.mark_exception(item.file_id, reason="EXCEPTION_MISSING_CORE_FIELDS")
-            db.set_meta("last_exception_reason", "EXCEPTION_MISSING_CORE_FIELDS")
-            db.mark_message_job_exception(msg_svr_id, note="EXCEPTION_MISSING_CORE_FIELDS")
-            print(f"[EXCEPTION] {path.name} | missing_core_fields | verification={resolution.verification_status}")
-            return
+        if blank_reason is not None:
+            fields = blank_receipt_fields(fields)
 
         review_needed = compute_review_needed(
             fields=fields,
@@ -7573,7 +7837,7 @@ def process_item(
         payload["excel_sheet"] = None
         payload["excel_row"] = None
         db.insert_receipt(payload)
-        db.mark_done(item.file_id, sha256=digest, processed_at=time.time())
+        db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note=blank_reason)
         db.resolve_related_file_paths(
             source_path=resolution.original_source_path,
             exclude_file_id=item.file_id,
@@ -7648,9 +7912,10 @@ def flush_ready_sink_rows(
         msg_create_time = float(claimed.get("msg_create_time") or 0.0)
         ingested_at = float(claimed.get("ingested_at") or 0.0)
         source_first_seen = float(claimed.get("source_first_seen") or 0.0)
-        if claimed["row_payload"].get("amount") is None:
+        if claimed["row_payload"].get("amount") is None and not claimed["row_payload"].get("blank_marker"):
             # Choke-point guard: no row without a value ever reaches the sheet,
-            # whatever path staged it (historical SINK_PENDING rows included).
+            # whatever path staged it (historical SINK_PENDING rows included),
+            # except the deliberate blank rows from blank_receipt_fields().
             db.mark_receipt_sink_skipped_terminal(file_id, note="NO_AMOUNT_GUARD")
             print(f"[SINK] skipped_no_amount | file_id={file_id} | msg={msg_svr_id} | talker={talker}")
             continue
@@ -7700,6 +7965,8 @@ def backfill_missing_receipt_fields(db: StateDB, sink: RowSink, cfg: Config, lim
     sheet_updated = 0
     sheet_failed = 0
     for row in rows:
+        if row["amount_source"] == BLANK_MARKER_SOURCE:
+            continue  # left blank on purpose for a human to fill in
         ocr_text = str(row["ocr_text"] or "")
         quality_score_value = float(row["quality_score"] or 0.0)
         parsed = parse_receipt_fields(
