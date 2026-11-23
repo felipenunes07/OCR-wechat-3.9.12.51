@@ -140,6 +140,7 @@ PDF_CORRELATION_GRACE_ATTEMPTS = 5
 STALE_PDF_MODIFY_SECONDS = 24 * 3600
 # Report the message index as stale once no merge has landed for this long.
 INDEX_STALE_WARN_SECONDS = 300
+INDEX_WAITER_KICK_SECONDS = 5
 
 # Client 991 sends receipts as short screen recordings instead of prints. The
 # video lane is deliberately scoped to that client: every other client sends
@@ -4782,8 +4783,13 @@ class StateDB:
                         WHEN ? > 0 THEN 1
                         ELSE 0
                     END ASC,
+                    -- video_receipt ranks with the direct images: it is a real
+                    -- receipt held only until its message reaches the index.
+                    -- Ranked last (23/11/2026) it starved behind 112 retries of
+                    -- vanished Temp previews and froze client 991 for 5 min.
                     CASE f.source_kind
                         WHEN 'msgattach_image_dat' THEN 0
+                        WHEN 'video_receipt' THEN 0
                         WHEN 'msgattach_image_plain' THEN 1
                         WHEN 'temp_image' THEN 2
                         WHEN 'msgattach_thumb_dat' THEN 3
@@ -5002,6 +5008,18 @@ class StateDB:
                 (status, next_attempt, err[:1200], file_id),
             )
             self._conn.commit()
+
+    def has_files_waiting_on_index(self) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM files
+                WHERE status = 'retry'
+                  AND last_error IN ('WAITING_VIDEO_MESSAGE', 'WAITING_PDF_MESSAGE')
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
 
     def mark_hold(self, file_id: str, reason: str, delay_sec: int = 120) -> None:
         next_attempt = time.time() + max(3, delay_sec)
@@ -8582,6 +8600,7 @@ def main() -> int:
         print("UI force download worker: disabled")
 
     last_reconcile = 0.0
+    last_index_kick = 0.0
     try:
         while True:
             now = time.time()
@@ -8602,6 +8621,19 @@ def main() -> int:
                             f"[RESOLVER] indice_desatualizado | ultimo_merge_ha={index_age:.0f}s"
                             f" | err={media_resolver.last_error or '-'}"
                         )
+
+            if (
+                media_resolver is not None
+                and now - last_index_kick >= INDEX_WAITER_KICK_SECONDS
+                and db.has_files_waiting_on_index()
+            ):
+                # The index only merges when something queries it, and a held
+                # video/PDF is only re-checked every few seconds. Without this
+                # kick the index aged ~5 min between merges (the stale-index
+                # self-heal above only fires past 300 s) and every print of
+                # the client queued behind the video (991, 23/11/2026).
+                media_resolver.refresh_if_due()
+                last_index_kick = now
 
             flush_ready_sink_rows(db, sink, cfg, media_resolver=media_resolver, max_rows=50)
             manual_session_started_at = db.get_manual_session_started_at() if is_manual_materialization_mode(db, cfg) else None
