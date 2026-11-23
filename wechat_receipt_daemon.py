@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import re
 import sqlite3
 import stat
@@ -31,7 +32,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path, PureWindowsPath
 from typing import Any, Optional
@@ -1108,7 +1109,35 @@ def today_local_date_str() -> str:
     return datetime.now().strftime("%d/%m/%Y")
 
 
+def _repair_ocr_year(dt: datetime) -> datetime:
+    """An impossible year is an OCR misread of the current one.
+
+    Crowded photos read "2026" as "2826"/"2828" and a print as "2613"
+    (client 199/991, 11/2026); those dates reached the sheet as written. Day
+    and month are kept; the year becomes this year, or last year when that
+    would put the receipt in the future (a December slip read in January).
+    """
+    now = datetime.now()
+    if 2020 <= dt.year <= now.year + 1:
+        return dt
+    for year in (now.year, now.year - 1):
+        try:
+            fixed = dt.replace(year=year)
+        except ValueError:
+            continue
+        if fixed <= now + timedelta(days=1):
+            return fixed
+    return dt
+
+
 def normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
+    parsed = _normalize_date_for_excel(value)
+    if parsed is None:
+        return None
+    return _repair_ocr_year(datetime.strptime(parsed, "%d/%m/%Y")).strftime("%d/%m/%Y")
+
+
+def _normalize_date_for_excel(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     v = value.strip()
@@ -1512,8 +1541,9 @@ def split_receipt_regions(spans: list["OCRSpan"]) -> list[tuple[str, list[int]]]
     def _same_line(a: "OCRSpan", s: "OCRSpan", left: float, right: float) -> bool:
         return (
             abs(s.y - a.y) <= 0.6 * line_h
-            and s.left <= right + 1.2 * line_h
-            and s.right >= left - 1.2 * line_h
+            # A word gap, not the gutter between two slips laid side by side.
+            and s.left <= right + 0.8 * line_h
+            and s.right >= left - 0.8 * line_h
         )
 
     # Widen each header to its whole printed line: a header the OCR cut short
@@ -1710,8 +1740,10 @@ def should_apply_compact_cent_fix(
     # words sit. A photo of the phone screen puts them far from the value, and
     # "R$27668" was launched as R$ 27.668 instead of R$ 276,68 (client 65,
     # 20/11/2026).
+    # Mercado Pago hides zero cents ("R$ 545"), so a glued token ending in
+    # "00" is a value whose thousands dot was lost ("R$ 2000"), not cents.
     if is_mercado_pago and 4 <= len(digits) <= 5:
-        return True
+        return not digits.endswith("00")
     # Tokens ending in "00" are NOT exempt: every layout except Mercado Pago
     # prints cents (~99% of 17k historical receipts), so "R$70000" is "R$ 700,00"
     # with the comma dropped, not a round R$ 70.000. Seven digits covers a fully
@@ -1739,7 +1771,8 @@ def extract_best_amount(lines: list[str]) -> AmountParseResult:
     # Mercado Pago prints cents as small superscript digits that OCR glues onto the
     # value ("R$ 837" + superscript "4" -> "R$ 8374"). Thousands always keep their
     # dot ("R$ 8.374"), so a glued no-separator token needs cent reconstruction.
-    is_mercado_pago = "mercado" in full_text_low and "pago" in full_text_low
+    # The brand, not "supermercado ... valor pago".
+    is_mercado_pago = "mercadopago" in re.sub(r"[^a-z]", "", full_text_low)
     for idx, line in enumerate(lines):
         prev2_low = lines[idx - 2].lower() if idx > 1 else ""
         prev_low = lines[idx - 1].lower() if idx > 0 else ""
@@ -2367,7 +2400,8 @@ def blank_receipt_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 # Authentication codes ("3.48C.4A5", "AE7.41B") touch letters; money does not.
-_SLIP_MONEY_PATTERN = re.compile(r"(?<![\w\.,:])\d{1,3}(?:[\.,:]\d{3})*[\.,:]\d{2}(?![\w]|[\.,:]\d)")
+# ":" only as a misread thousands dot ("2:000.00"); "14:30" is a time.
+_SLIP_MONEY_PATTERN = re.compile(r"(?<![\w\.,:])\d{1,3}(?:[\.,:]\d{3})*[\.,]\d{2}(?![\w]|[\.,:]\d)")
 _SLIP_NOTE_COUNT_PATTERN = re.compile(r"processadas\s*(\d{1,3})(?![\d\.,:])")
 CASH_DEPOSIT_UNREADABLE = "UNREADABLE"
 
@@ -2388,7 +2422,11 @@ def reconcile_cash_deposit_amount(text: str) -> Optional[float | str]:
     if "valor" not in norm or not any(tok in norm for tok in ("dinheiro", "cedulas", "deposito")):
         return None
     values = []
-    for token in _SLIP_MONEY_PATTERN.findall(text):
+    money_text = "\n".join(
+        line for line in text.splitlines()
+        if not any(tok in strip_accents(line.lower()) for tok in ("tarifa", "saldo", "taxa", "limite"))
+    )
+    for token in _SLIP_MONEY_PATTERN.findall(money_text):
         value = normalize_amount(token.replace(":", "."))
         if value is not None and value > 0:
             values.append(value)
@@ -2862,13 +2900,16 @@ class WeChatDBResolver:
         return applied
 
     def _decrypt_db_with_wal(self, src_db: Path, out_db: Path) -> tuple[bool, str]:
+        # Only the first page is needed for the key; the whole shard (~280 MB)
+        # is read only when its decrypted cache is stale.
         try:
-            raw = src_db.read_bytes()
+            with open(src_db, "rb") as fh:
+                head = fh.read(self._PAGE_SIZE)
         except Exception as exc:
             return False, f"read_failed:{type(exc).__name__}:{exc}"
-        if len(raw) < self._PAGE_SIZE:
+        if len(head) < self._PAGE_SIZE:
             return False, "db_too_small"
-        aes_key = self._derive_page_key(raw)
+        aes_key = self._derive_page_key(head)
         if aes_key is None:
             return False, "no_key"
 
@@ -2887,6 +2928,10 @@ class WeChatDBResolver:
         except Exception:
             base = None
         if base is None:
+            try:
+                raw = src_db.read_bytes()
+            except Exception as exc:
+                return False, f"read_failed:{type(exc).__name__}:{exc}"
             base = self._decrypt_base_db(raw, aes_key)
             try:
                 cache_path.write_bytes(base)
@@ -2911,11 +2956,76 @@ class WeChatDBResolver:
     def _merge_real_time_db_with_timeout_path(self, target_path: Path) -> tuple[bool, str]:
         assert self._wx_dir is not None
         multi_dir = self._wx_dir / "Msg" / "Multi"
-        shards = sorted(multi_dir.glob("MSG*.db"), key=lambda p: p.name)
-        shards = [p for p in shards if re.fullmatch(r"msg\d+\.db", p.name.lower())]
+        shards = [p for p in multi_dir.glob("MSG*.db") if re.fullmatch(r"msg\d+\.db", p.name.lower())]
+        shards.sort(key=lambda p: int(re.sub(r"\D", "", p.name)))
         if not shards:
             return False, f"no_msg_shards_in:{multi_dir}"
+        if len(shards) == 1:
+            return self._merge_shards_into(shards, target_path)
 
+        # WeChat only writes to the newest shard; the older ones (and their
+        # WALs) stay untouched for weeks. Their merge is kept ready in
+        # frozen_msg.cache.db, so a cycle decrypts and appends one shard
+        # instead of rebuilding ~550 MB. A full rebuild took 27-40 s and
+        # videos waited minutes for their message (22/11/2026).
+        frozen, active = shards[:-1], shards[-1]
+        frozen_cache = target_path.parent / "frozen_msg.cache.db"
+        frozen_meta = frozen_cache.with_suffix(".meta")
+        sig_parts = []
+        for shard in frozen:
+            for part in (shard, shard.with_name(shard.name + "-wal")):
+                try:
+                    st = part.stat()
+                    sig_parts.append(f"{part.name}:{st.st_size}:{st.st_mtime_ns}")
+                except FileNotFoundError:
+                    sig_parts.append(f"{part.name}:-")
+        frozen_sig = "|".join(sig_parts)
+        try:
+            cache_ok = (
+                frozen_cache.exists()
+                and frozen_meta.exists()
+                and frozen_meta.read_text(encoding="utf-8") == frozen_sig
+            )
+        except Exception:
+            cache_ok = False
+        if not cache_ok:
+            building = target_path.with_name(f"frozen_build_{target_path.name}")
+            code, detail = self._merge_shards_into(frozen, building)
+            if not code:
+                try:
+                    if building.exists():
+                        building.unlink()
+                except Exception:
+                    pass
+                return False, f"frozen_build_failed:{detail}"
+            try:
+                os.replace(building, frozen_cache)
+                frozen_meta.write_text(frozen_sig, encoding="utf-8")
+            except Exception as exc:
+                try:
+                    if building.exists():
+                        building.unlink()
+                except Exception:
+                    pass
+                return False, f"frozen_store_failed:{type(exc).__name__}:{exc}"
+        try:
+            if target_path.exists():
+                target_path.unlink()
+            shutil.copyfile(frozen_cache, target_path)
+        except Exception as exc:
+            return False, f"frozen_copy_failed:{type(exc).__name__}:{exc}"
+        code, detail = self._merge_shards_into([active], target_path, append=True)
+        if not code:
+            return False, detail
+        state = "frozen_hit" if cache_ok else "frozen_rebuilt"
+        return True, f"ok:{len(shards)}_shards:{state}:{detail}"
+
+    def _merge_shards_into(self, shards: list[Path], target_path: Path, append: bool = False) -> tuple[bool, str]:
+        """Decrypt `shards` and merge their MSG rows into `target_path`.
+
+        append=False: the first shard becomes the target, the rest are added.
+        append=True: the target already exists; every shard is added to it.
+        """
         decrypted: list[Path] = []
         try:
             for shard in shards:
@@ -2929,7 +3039,7 @@ class WeChatDBResolver:
                 if not code:
                     return False, f"{shard.name}:{detail}"
 
-            if len(decrypted) == 1:
+            if len(decrypted) == 1 and not append:
                 try:
                     if target_path.exists():
                         target_path.unlink()
@@ -2940,9 +3050,12 @@ class WeChatDBResolver:
 
             # Multiple shards: copy the first, append the MSG rows of the rest.
             try:
-                if target_path.exists():
-                    target_path.unlink()
-                decrypted[0].replace(target_path)
+                extras = decrypted
+                if not append:
+                    if target_path.exists():
+                        target_path.unlink()
+                    decrypted[0].replace(target_path)
+                    extras = decrypted[1:]
                 conn = sqlite3.connect(str(target_path))
                 try:
                     # The file being built is a throwaway until the swap, so
@@ -2964,7 +3077,7 @@ class WeChatDBResolver:
                         return False, "multi_merge_failed:msg_table_without_columns"
                     col_list = ",".join(f'"{c}"' for c in copy_cols)
                     merged_rows = 0
-                    for extra in decrypted[1:]:
+                    for extra in extras:
                         conn.execute("ATTACH DATABASE ? AS extra", (str(extra),))
                         cur = conn.execute(
                             f"INSERT INTO main.MSG ({col_list}) "
@@ -3174,6 +3287,9 @@ class WeChatDBResolver:
                         if self._last_error is not None:
                             print(f"[RESOLVER] merge recuperado ({ret})")
                         self._last_refresh = time.time()
+                        merge_s = self._last_refresh - started_at
+                        if merge_s > 20:
+                            print(f"[RESOLVER] merge_lento | {merge_s:.0f}s | {ret}")
                         self._last_failure = 0.0
                         self._last_error = None
                         self._merged_signature = source_sig
@@ -5284,6 +5400,7 @@ class StateDB:
                     COALESCE(f.mtime, r.ingested_at) ASC,
                     {order_by},
                     r.ingested_at ASC,
+                    LENGTH(r.file_id) ASC,
                     r.file_id ASC
                 """,
                 (
@@ -5643,13 +5760,15 @@ class StateDB:
                        sheet_status, sheet_payload_json, excel_sheet, excel_row,
                        msg_svr_id, talker, resolution_source
                 FROM receipts
-                WHERE txn_date IS NULL OR TRIM(txn_date)=''
+                WHERE COALESCE(amount_source, '') <> 'blank_marker' AND (
+                      txn_date IS NULL OR TRIM(txn_date)=''
                    OR txn_time IS NULL OR TRIM(txn_time)=''
                    OR txn_date_source IS NULL OR TRIM(txn_date_source)=''
                    OR txn_time_source IS NULL OR TRIM(txn_time_source)=''
                    OR amount_raw IS NULL OR TRIM(amount_raw)=''
                    OR amount_rounded IS NULL
                    OR amount_source IS NULL OR TRIM(amount_source)=''
+                )
                 ORDER BY ingested_at ASC
                 LIMIT ?
                 """,
@@ -7770,7 +7889,10 @@ def process_item(
             # of 22/11/2026: BB incident slip, Remitly and "Pix de R$ 500"
             # cards had vanished). PDFs (invoices) and wide strips (the team's
             # own spreadsheet crops) keep the old exception, never a row.
-            if client and should_write_blank_row(img, resolution.resolved_source_kind):
+            # A scrolled-down sender print (no value by design) whose receipt
+            # was not matched above would duplicate a real row as a blank.
+            looks_partial = looks_like_sender_continuation(text) or looks_like_receipt_fragment(text)
+            if client and not looks_partial and should_write_blank_row(img, resolution.resolved_source_kind):
                 blank_reason = reason
                 print(f"[BLANK] {path.name} | {label} | linha_em_branco_na_planilha | cliente={client}")
                 break

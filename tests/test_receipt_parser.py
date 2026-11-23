@@ -2855,5 +2855,17 @@ class ClientSendsTests(unittest.TestCase):
         self.assertEqual(parse_receipt_fields(text, ocr_conf=0.9, q_score=0.9)["amount"], 3085.6)
 
 
+class OcrYearRepairTests(unittest.TestCase):
+    def test_impossible_years_become_this_year(self) -> None:
+        # Crowded photos read "2026" as "2826"/"2828"/"0008" (11/2026).
+        from datetime import datetime
+
+        from wechat_receipt_daemon import normalize_date_for_excel
+
+        this_year = datetime.now().year
+        self.assertEqual(normalize_date_for_excel("12/01/2826"), f"12/01/{this_year}")
+        self.assertEqual(normalize_date_for_excel("12/01/0008"), f"12/01/{this_year}")
+        self.assertEqual(normalize_date_for_excel("21/11/2025"), "21/11/2025")
+
 if __name__ == "__main__":
     unittest.main()
