@@ -5183,13 +5183,23 @@ class StateDB:
         exclude_file_id: str,
         client: Optional[str],
         window_seconds: float,
+        opened_at: float = 0.0,
     ) -> bool:
         """True if another file with byte-identical content was ingested for the
-        same client less than ``window_seconds`` ago. Sheet status is irrelevant:
-        a staged-but-not-yet-committed twin counts as well."""
+        same client less than ``window_seconds`` before now or before this file
+        was opened (``opened_at``). Sheet status is irrelevant: a
+        staged-but-not-yet-committed twin counts as well.
+
+        Anchoring on the opening matters for retries: a Temp preview opened at
+        15:48 vanished, its retry ran at 15:54 and resolved to the .dat already
+        ingested at 15:52:03 -- 130 s later, past the window, so client 16's
+        R$ 3350 landed twice (23/11/2026)."""
         if not sha256:
             return False
-        since = time.time() - float(window_seconds)
+        anchor = time.time()
+        if opened_at > 0:
+            anchor = min(anchor, float(opened_at))
+        since = anchor - float(window_seconds)
         with self._lock:
             row = self._conn.execute(
                 """
@@ -7618,7 +7628,13 @@ def process_item(
         # arriving through the direct_image and db_image lanes (msg_svr_id dedup
         # misses it because the first pass had no msg id), or WeChat materialising
         # the same picture under two names. Both were producing duplicated rows.
-        if db.receipt_sha_exists_recent(digest, item.file_id, client, window_seconds=IMAGE_SHA_DEDUP_WINDOW_SECONDS):
+        if db.receipt_sha_exists_recent(
+            digest,
+            item.file_id,
+            client,
+            window_seconds=IMAGE_SHA_DEDUP_WINDOW_SECONDS,
+            opened_at=float(item.first_seen or 0.0),
+        ):
             db.mark_done(item.file_id, sha256=digest, processed_at=time.time(), note="DUPLICATE_SHA_RECENT")
             db.mark_message_job_resolved(msg_svr_id, note="DUPLICATE_SHA_RECENT")
             print(f"[DEDUP] {path.name} | imagem_identica_ha_menos_de_{IMAGE_SHA_DEDUP_WINDOW_SECONDS}s | cliente={client}")

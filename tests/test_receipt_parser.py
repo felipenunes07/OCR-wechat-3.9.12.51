@@ -1362,6 +1362,38 @@ class ManualSessionOrderTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_sha_dedup_window_counts_from_when_the_file_was_opened(self) -> None:
+        # 23/11/2026, client 16, R$ 3350: the Temp preview opened at 15:48
+        # vanished, its retry ran at 15:54, resolved to the .dat already
+        # ingested at 15:52:03 and landed 130 s later -- past the 120 s window.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                db._conn.execute(
+                    "INSERT INTO receipts(file_id, source_path, source_kind, ingested_at, sha256, client,"
+                    " parse_conf, quality_score, ocr_engine, ocr_conf, ocr_chars, review_needed)"
+                    " VALUES('dat-file', 'C:/fake/x.dat', 'msgattach_image_dat', 1240.0, 'abc', '16',"
+                    " 1, 1, 'test', 1, 10, 0)"
+                )
+                db._conn.commit()
+                with patch("wechat_receipt_daemon.time.time", return_value=1370.0):
+                    self.assertTrue(
+                        db.receipt_sha_exists_recent(
+                            "abc", "temp-file", "16", window_seconds=120, opened_at=1000.0
+                        )
+                    )
+                    # A client re-sending the same screenshot much later still lands.
+                    self.assertFalse(
+                        db.receipt_sha_exists_recent(
+                            "abc", "later-file", "16", window_seconds=120, opened_at=1365.0
+                        )
+                    )
+                    self.assertFalse(
+                        db.receipt_sha_exists_recent("abc", "later-file", "16", window_seconds=120)
+                    )
+            finally:
+                db.close()
+
     def test_files_waiting_on_index_only_counts_message_holds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = StateDB(Path(tmp_dir) / "state.db")
