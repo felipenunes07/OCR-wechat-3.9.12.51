@@ -1328,6 +1328,68 @@ class ManualSessionOrderTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_claim_next_does_not_starve_a_held_video_behind_temp_retries(self) -> None:
+        # 23/11/2026: a 991 video sat 5 min with one single HOLD while the
+        # worker churned through 112 retries of vanished Temp previews; every
+        # 991 print opened after the video waited behind it.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="video-file",
+                    path="C:/fake/Video/2026-11/held.mp4",
+                    source_kind="video_receipt",
+                    status="retry",
+                    first_seen=1000.0,
+                    last_error="WAITING_VIDEO_MESSAGE",
+                )
+                insert_file_row(
+                    db,
+                    file_id="temp-file",
+                    path="C:/fake/Temp/gone_.jpg",
+                    source_kind="temp_image",
+                    status="retry",
+                    first_seen=1005.0,
+                    last_error="FileNotFoundError: Resolved file disappeared",
+                )
+
+                with patch("wechat_receipt_daemon.time.time", return_value=1010.0):
+                    claimed = db.claim_next()
+
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.file_id, "video-file")
+            finally:
+                db.close()
+
+    def test_files_waiting_on_index_only_counts_message_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = StateDB(Path(tmp_dir) / "state.db")
+            try:
+                insert_file_row(
+                    db,
+                    file_id="temp-file",
+                    path="C:/fake/Temp/gone_.jpg",
+                    source_kind="temp_image",
+                    status="retry",
+                    first_seen=1000.0,
+                    last_error="FileNotFoundError: Resolved file disappeared",
+                )
+                self.assertFalse(db.has_files_waiting_on_index())
+
+                insert_file_row(
+                    db,
+                    file_id="video-file",
+                    path="C:/fake/Video/2026-11/held.mp4",
+                    source_kind="video_receipt",
+                    status="retry",
+                    first_seen=1001.0,
+                    last_error="WAITING_VIDEO_MESSAGE",
+                )
+                self.assertTrue(db.has_files_waiting_on_index())
+            finally:
+                db.close()
+
     def test_seed_ready_manual_session_placeholders_only_within_burst_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = StateDB(Path(tmp_dir) / "state.db")
